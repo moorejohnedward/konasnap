@@ -1512,7 +1512,8 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             foreach (Form f in EnumerateForms())
                 if (f.Visible && !(f is RegionForm)) { hidden.Add(f); f.Hide(); }
             var t = new System.Windows.Forms.Timer();
-            t.Interval = Math.Max(300, delayMs);
+            // Wait only as long as needed: a moment for hidden KonaSnap windows to leave the screen, or the countdown.
+            t.Interval = Math.Max(hidden.Count > 0 ? 140 : 1, delayMs);
             t.Tick += delegate
             {
                 t.Stop();
@@ -1535,7 +1536,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         void DoCapture(bool full, bool textOnly, bool scroll, Action<EditorForm> finish)
         {
             Rectangle vs = SystemInformation.VirtualScreen;
-            var shot = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppArgb);
+            var shot = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppPArgb); // premultiplied: fastest format for GDI+ to draw
             using (var g = Graphics.FromImage(shot))
                 g.CopyFromScreen(vs.Left, vs.Top, 0, 0, vs.Size, CopyPixelOperation.SourceCopy);
 
@@ -1579,9 +1580,35 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
                 RunTextGrab(element, screenRect, img, finish);
                 return;
             }
-            string path = SaveNew(img);
-            try { Clipboard.SetImage(img); } catch { }
+            // Open the editor right away; the PNG is written in the background and the clipboard filled just after.
+            string path = NewCapturePath();
+            var forDisk = img.Clone(new Rectangle(0, 0, img.Width, img.Height), PixelFormat.Format32bppArgb);
+            var forClip = img.Clone(new Rectangle(0, 0, img.Width, img.Height), PixelFormat.Format32bppArgb);
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { lock (SaveLock) forDisk.Save(path, ImageFormat.Png); }
+                catch (Exception ex) { Updater.Report(ex, false); }
+                finally { forDisk.Dispose(); }
+            });
             finish(new EditorForm(img, path));
+            BeginInvoke((MethodInvoker)delegate
+            {
+                try { Clipboard.SetImage(forClip); } catch { }
+                forClip.Dispose();
+            });
+        }
+
+        // Saves to disk never overlap (background save of a new capture vs. the editor saving the same file).
+        public static readonly object SaveLock = new object();
+
+        static string NewCapturePath()
+        {
+            Directory.CreateDirectory(CaptureDir);
+            string baseName = "Capture " + DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss");
+            string path = Path.Combine(CaptureDir, baseName + ".png");
+            int n = 2;
+            while (File.Exists(path)) { path = Path.Combine(CaptureDir, baseName + " (" + n + ").png"); n++; }
+            return path;
         }
 
         void RunScroll(Rectangle screenRect, Action<EditorForm> finish)
@@ -1686,12 +1713,8 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
 
         static string SaveNew(Bitmap img)
         {
-            Directory.CreateDirectory(CaptureDir);
-            string baseName = "Capture " + DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss");
-            string path = Path.Combine(CaptureDir, baseName + ".png");
-            int n = 2;
-            while (File.Exists(path)) { path = Path.Combine(CaptureDir, baseName + " (" + n + ").png"); n++; }
-            img.Save(path, ImageFormat.Png);
+            string path = NewCapturePath();
+            lock (SaveLock) img.Save(path, ImageFormat.Png);
             return path;
         }
     }
@@ -1750,10 +1773,15 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         {
             base.OnLoad(e);
             Bounds = vs;
-            dim = new Bitmap(shot);
+            dim = new Bitmap(shot.Width, shot.Height, PixelFormat.Format32bppPArgb);
             using (var g = Graphics.FromImage(dim))
             using (var b = new SolidBrush(Color.FromArgb(110, 4, 24, 34)))
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.DrawImageUnscaled(shot, 0, 0);
+                g.CompositingMode = CompositingMode.SourceOver;
                 g.FillRectangle(b, 0, 0, dim.Width, dim.Height);
+            }
             mouse = PointToClient(Cursor.Position);
             hover = WindowAt(mouse);
             restTimer.Start();
@@ -1845,7 +1873,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             if (userLevel >= 0) chainIndex = Math.Min(userLevel, c.Count - 1);
             else chainIndex = smartDefault ? Uia.DefaultIndex(c) : 0;
             hover = chain[chainIndex].Rect;
-            Dirty(old); Dirty(Current);
+            Changed(old, Current);
             if (fresh) { restTimer.Stop(); restTimer.Start(); }
         }
 
@@ -1856,6 +1884,31 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         }
 
         // ---------------- painting
+        // Repaints only what changed between the old and new highlight: the area that switched between
+        // dim and bright, the borders and handles of both, and their size labels. Repainting both whole
+        // rectangles on every mouse move is what made dragging a big area feel heavy.
+        void Changed(Rectangle a, Rectangle b)
+        {
+            if (a == b) return;
+            using (var reg = new Region(Rectangle.Empty))
+            {
+                bool hasA = a.Width > 0 && a.Height > 0, hasB = b.Width > 0 && b.Height > 0;
+                if (hasA) reg.Union(a);
+                if (hasB) reg.Xor(b);
+                foreach (var r in new Rectangle[] { a, b })
+                {
+                    if (r.Width <= 0 || r.Height <= 0) continue;
+                    const int t = 12;
+                    reg.Union(new Rectangle(r.X - t, r.Y - t, r.Width + 2 * t, 2 * t));      // top edge
+                    reg.Union(new Rectangle(r.X - t, r.Bottom - t, r.Width + 2 * t, 2 * t)); // bottom edge
+                    reg.Union(new Rectangle(r.X - t, r.Y - t, 2 * t, r.Height + 2 * t));     // left edge
+                    reg.Union(new Rectangle(r.Right - t, r.Y - t, 2 * t, r.Height + 2 * t)); // right edge
+                    reg.Union(new Rectangle(r.X - 6, r.Y - 64, 420, 128));                    // size label (above or inside)
+                }
+                Invalidate(reg);
+            }
+        }
+
         void Dirty(Rectangle r)
         {
             if (r.Width <= 0 && r.Height <= 0) return;
@@ -2008,7 +2061,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
                 restTimer.Stop();
                 restTimer.Start();
             }
-            if (old != Current) { Dirty(old); Dirty(Current); }
+            if (old != Current) Changed(old, Current);
             var nl = LoupeRect(mouse);
             oldLoupe.Inflate(8, 8); nl.Inflate(8, 8);
             Invalidate(oldLoupe);
@@ -2025,7 +2078,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             chainIndex = ni;
             userLevel = ni;
             hover = chain[ni].Rect;
-            Dirty(old); Dirty(Current);
+            Changed(old, Current);
         }
 
         void Choose(Rectangle r)
@@ -2993,19 +3046,26 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
     class BlurAnn : Ann
     {
         public Rectangle R;
+        Bitmap cache; Rectangle cacheR; Bitmap cacheOf;
         public override void Draw(Graphics g, Bitmap baseImg)
         {
             var r = Rectangle.Intersect(R, new Rectangle(0, 0, baseImg.Width, baseImg.Height));
             if (r.Width < 2 || r.Height < 2) return;
             const int block = 12;
             int sw = Math.Max(1, r.Width / block), sh = Math.Max(1, r.Height / block);
-            using (var small = new Bitmap(sw, sh))
+            if (cache == null || cacheR != r || cacheOf != baseImg)
             {
-                using (var sg = Graphics.FromImage(small))
+                if (cache != null) cache.Dispose();
+                cache = new Bitmap(sw, sh);
+                using (var sg = Graphics.FromImage(cache))
                 {
                     sg.InterpolationMode = InterpolationMode.HighQualityBilinear;
                     sg.DrawImage(baseImg, new Rectangle(0, 0, sw, sh), r, GraphicsUnit.Pixel);
                 }
+                cacheR = r; cacheOf = baseImg;
+            }
+            var small = cache;
+            {
                 var st = g.Save();
                 g.InterpolationMode = InterpolationMode.NearestNeighbor;
                 g.PixelOffsetMode = PixelOffsetMode.Half;
@@ -3628,12 +3688,57 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         }
 
         // ---------------- painting
+        // The picture as shown at the current zoom, kept ready so drawing an arrow or box only has to
+        // copy pixels instead of rescaling the whole capture on every mouse move.
+        Bitmap view;
+        Bitmap viewOf;
+        float viewZoom;
+
+        Bitmap View()
+        {
+            if (view != null && viewOf == img && viewZoom == zoom) return view;
+            if (view != null) { view.Dispose(); view = null; }
+            int w = Math.Max(1, (int)Math.Round(img.Width * zoom)), h = Math.Max(1, (int)Math.Round(img.Height * zoom));
+            if ((long)w * h > 60000000L) return null; // very deep zoom on a huge capture: draw directly instead
+            try
+            {
+                var v = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+                using (var vg = Graphics.FromImage(v))
+                {
+                    vg.InterpolationMode = zoom < 1f ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
+                    vg.PixelOffsetMode = PixelOffsetMode.Half;
+                    vg.DrawImage(img, new Rectangle(0, 0, w, h), new Rectangle(0, 0, img.Width, img.Height), GraphicsUnit.Pixel);
+                }
+                view = v; viewOf = img; viewZoom = zoom;
+                return view;
+            }
+            catch (OutOfMemoryException) { return null; }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && view != null) { view.Dispose(); view = null; }
+            base.Dispose(disposing);
+        }
+
         void PaintCanvas(Graphics g)
         {
-            g.ScaleTransform(zoom, zoom);
-            g.InterpolationMode = zoom < 1f ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
-            g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.DrawImage(img, 0, 0, img.Width, img.Height);
+            var v = View();
+            if (v != null)
+            {
+                var clip = Rectangle.Intersect(Rectangle.Round(g.ClipBounds), new Rectangle(0, 0, v.Width, v.Height));
+                g.CompositingMode = CompositingMode.SourceCopy;
+                if (clip.Width > 0 && clip.Height > 0) g.DrawImage(v, clip, clip, GraphicsUnit.Pixel);
+                g.CompositingMode = CompositingMode.SourceOver;
+                g.ScaleTransform(zoom, zoom);
+            }
+            else
+            {
+                g.ScaleTransform(zoom, zoom);
+                g.InterpolationMode = zoom < 1f ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.DrawImage(img, 0, 0, img.Width, img.Height);
+            }
             g.PixelOffsetMode = PixelOffsetMode.Default;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
@@ -3894,7 +3999,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             CommitText();
             try
             {
-                using (var b = Render()) b.Save(path, ImageFormat.Png);
+                using (var b = Render()) lock (MainForm.SaveLock) b.Save(path, ImageFormat.Png);
                 dirty = false;
                 status.Text = "Saved to " + path;
             }

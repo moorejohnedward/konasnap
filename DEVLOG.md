@@ -28,9 +28,18 @@ Each entry records what was built, why, and the concepts behind it. The Git comm
 
 ---
 
-## 2026-11-11: v2.1, In-app updates, GitHub and crash reports
+## 2026-11-11: v2.1, Speed, in-app updates, GitHub and crash reports
 
 **Problem:** KonaSnap showed a generic ".NET Framework unhandled exception" box every time it opened, with no record of what went wrong, and every change meant rebuilding on my PC with build.bat.
+
+**Problem 2:** Captures felt sluggish.
+
+**Speed fixes (profiling the capture path step by step)**
+- Removed a fixed 300 ms wait before every capture. It's only needed when KonaSnap's own window has to get out of the way, and then 140 ms is enough.
+- Screenshots now use the premultiplied-alpha pixel format (32bppPArgb). GDI+ draws it several times faster than the default format.
+- The picker repaints only the region that changed between mouse moves (a symmetric difference of the old and new rectangles plus their borders and labels) instead of both whole rectangles.
+- The editor opens first, while a background thread writes the PNG. A lock keeps that save from overlapping with the editor's own saves.
+- The editor caches the picture at the current zoom level, and blur boxes cache their pixelated patch, so markup drawing is just a pixel copy.
 
 **Built**
 - **Crash reporter** (`Updater.InstallCrashHandlers`, `Updater.Report`): catches errors on the UI thread and in the background, writes the full stack trace with the Windows and .NET versions to `%LOCALAPPDATA%\KonaSnap\crash.log`, copies it to the clipboard, and shows a plain-English message.
@@ -41,7 +50,7 @@ Each entry records what was built, why, and the concepts behind it. The Git comm
   - `build.yml` compiles KonaSnap on GitHub's Windows servers with the same `build.bat` on every push.
   - `release.yml`: when `Updater.Version` goes up, GitHub builds KonaSnap.exe, attaches its fingerprint and publishes a Release with notes from CHANGELOG.md.
 
-**Concepts:** version control with Git, semantic versioning, continuous integration and delivery (GitHub Actions), REST APIs and JSON (parsed with regular expressions, since .NET Framework 4's compiler has no built-in JSON), TLS 1.2 for HTTPS on older .NET, background threads with `ThreadPool` and marshaling back to the UI thread with `BeginInvoke`, cryptographic hashing, global exception handling.
+**Concepts:** performance profiling, dirty-region repainting, caching, pixel formats, thread safety with locks, version control with Git, semantic versioning, continuous integration and delivery (GitHub Actions), REST APIs and JSON (parsed with regular expressions, since .NET Framework 4's compiler has no built-in JSON), TLS 1.2 for HTTPS on older .NET, background threads with `ThreadPool` and marshaling back to the UI thread with `BeginInvoke`, cryptographic hashing, global exception handling.
 
 **Result:** After this one install, new versions arrive with one click from inside KonaSnap, and any crash leaves a report that pinpoints the line that failed.
 
