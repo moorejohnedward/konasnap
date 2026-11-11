@@ -1,0 +1,1327 @@
+// KonaSnap - a simple Snagit-style screen capture and markup tool for Windows.
+// Build with build.bat (uses the C# compiler that ships with Windows / .NET Framework 4).
+// C# 5 syntax only, so it compiles with the built-in csc.exe.
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace KonaSnap
+{
+    static class Program
+    {
+        [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+
+        [STAThread]
+        static void Main()
+        {
+            try { SetProcessDPIAware(); } catch { }
+            bool created;
+            using (var mutex = new Mutex(true, "KonaSnap_SingleInstance_Mutex", out created))
+            {
+                if (!created)
+                {
+                    IntPtr h = Native.FindWindow(null, MainForm.AppTitle);
+                    if (h != IntPtr.Zero) { Native.ShowWindow(h, 9); Native.SetForegroundWindow(h); }
+                    return;
+                }
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new MainForm());
+            }
+        }
+    }
+
+    static class Native
+    {
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+        public delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
+        [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+        [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
+
+        // Visible top-level windows, top of the z-order first, in screen coordinates.
+        public static List<Rectangle> VisibleWindowRects()
+        {
+            var list = new List<Rectangle>();
+            EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                try
+                {
+                    if (!IsWindowVisible(h) || IsIconic(h)) return true;
+                    int cloaked;
+                    if (DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) return true;
+                    if ((GetWindowLong(h, -20) & 0x80) != 0) return true; // tool windows
+                    if (GetWindowTextLength(h) == 0) return true;
+                    var sb = new StringBuilder(64);
+                    GetClassName(h, sb, 64);
+                    string cls = sb.ToString();
+                    if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd") return true;
+                    RECT r;
+                    if (DwmGetWindowAttribute(h, 9, out r, Marshal.SizeOf(typeof(RECT))) != 0) GetWindowRect(h, out r);
+                    var rc = Rectangle.FromLTRB(r.L, r.T, r.R, r.B);
+                    if (rc.Width > 40 && rc.Height > 40) list.Add(rc);
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+            return list;
+        }
+    }
+
+    // ------------------------------------------------------------------ text recognition (Windows built-in OCR)
+    static class Ocr
+    {
+        // Runs Windows.Media.Ocr through Windows PowerShell, so no extra SDK or download is needed.
+        const string Script = @"param([string]$Path)
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, $type) { $t = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op)); $null = $t.Wait(-1); $t.Result }
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+if ($decoder.PixelWidth -gt $max -or $decoder.PixelHeight -gt $max) {
+  $s = [Math]::Min($max / $decoder.PixelWidth, $max / $decoder.PixelHeight)
+  $tr = [Windows.Graphics.Imaging.BitmapTransform]::new()
+  $tr.ScaledWidth = [uint32][Math]::Floor($decoder.PixelWidth * $s)
+  $tr.ScaledHeight = [uint32][Math]::Floor($decoder.PixelHeight * $s)
+  $tr.InterpolationMode = [Windows.Graphics.Imaging.BitmapInterpolationMode]::Fant
+  $bitmap = Await ($decoder.GetSoftwareBitmapAsync([Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8, [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied, $tr, [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation, [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage)) ([Windows.Graphics.Imaging.SoftwareBitmap])
+} else {
+  $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+}
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if ($engine -eq $null) { [Console]::Error.WriteLine('NO_OCR_LANGUAGE'); exit 2 }
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+$stream.Dispose()
+foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
+";
+
+        public static string Run(Bitmap src, out string error)
+        {
+            error = null;
+            string dir = Path.Combine(Path.GetTempPath(), "KonaSnap");
+            Directory.CreateDirectory(dir);
+            string script = Path.Combine(dir, "ocr.ps1");
+            File.WriteAllText(script, Script, new UTF8Encoding(true));
+            string imgPath = Path.Combine(dir, "ocr-" + Guid.NewGuid().ToString("N") + ".png");
+            try
+            {
+                // Small text reads better when the image is enlarged first.
+                int longest = Math.Max(src.Width, src.Height);
+                float k = longest < 1800 ? 2f : 1f;
+                using (var big = new Bitmap(Math.Max(1, (int)(src.Width * k)), Math.Max(1, (int)(src.Height * k)), PixelFormat.Format24bppRgb))
+                {
+                    using (var g = Graphics.FromImage(big))
+                    {
+                        g.Clear(Color.White);
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g.DrawImage(src, 0, 0, big.Width, big.Height);
+                    }
+                    big.Save(imgPath, ImageFormat.Png);
+                }
+
+                var psi = new System.Diagnostics.ProcessStartInfo("powershell.exe",
+                    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script + "\" \"" + imgPath + "\"");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
+                psi.StandardErrorEncoding = Encoding.UTF8;
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    string output = p.StandardOutput.ReadToEnd();
+                    if (!p.WaitForExit(60000)) { try { p.Kill(); } catch { } error = "Reading the text took too long."; return ""; }
+                    string err = errTask.Result;
+                    if (err.Contains("NO_OCR_LANGUAGE"))
+                        error = "Windows has no text-recognition language installed. Add one in Settings > Time & language > Language & region.";
+                    else if (p.ExitCode != 0 && output.Trim().Length == 0)
+                        error = "Windows couldn't read text from this image." + (err.Trim().Length > 0 ? " (" + FirstLine(err) + ")" : "");
+                    return output.Replace("\r\n", "\n").Trim();
+                }
+            }
+            catch (Exception ex)
+            {
+                error = "Text reading failed: " + ex.Message;
+                return "";
+            }
+            finally
+            {
+                try { File.Delete(imgPath); } catch { }
+            }
+        }
+
+        static string FirstLine(string s)
+        {
+            s = s.Trim();
+            int i = s.IndexOf('\n');
+            return i > 0 ? s.Substring(0, i).Trim() : s;
+        }
+
+        // Reads text on a background thread, then calls done(text, error) on the UI thread.
+        public static void RunAsync(Control owner, Bitmap bmp, Action<string, string> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string err;
+                string text = Run(bmp, out err);
+                bmp.Dispose();
+                try { owner.BeginInvoke((MethodInvoker)delegate { done(text, err); }); } catch { }
+            });
+        }
+
+        public static void ShowResult(string text, string err, float S)
+        {
+            if (err != null && text.Length == 0) { MessageBox.Show(err, MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            if (text.Length == 0) { MessageBox.Show("No text was found in that area.", MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            try { Clipboard.SetText(text.Replace("\n", "\r\n")); } catch { }
+            var f = new TextResultForm(text, S);
+            f.Show();
+            f.Activate();
+        }
+    }
+
+    class TextResultForm : Form
+    {
+        public TextResultForm(string text, float S)
+        {
+            Text = "KonaSnap - Text";
+            Font = new Font("Segoe UI", 10f);
+            StartPosition = FormStartPosition.CenterScreen;
+            Size = new Size((int)(600 * S), (int)(440 * S));
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
+            var tb = new TextBox();
+            tb.Multiline = true;
+            tb.ScrollBars = ScrollBars.Vertical;
+            tb.Dock = DockStyle.Fill;
+            tb.BorderStyle = BorderStyle.None;
+            tb.Font = new Font("Segoe UI", 11f);
+            tb.Text = text.Replace("\n", "\r\n");
+
+            var holder = new Panel();
+            holder.Dock = DockStyle.Fill;
+            holder.Padding = new Padding((int)(12 * S));
+            holder.BackColor = Color.White;
+            holder.Controls.Add(tb);
+
+            var bottom = new FlowLayoutPanel();
+            bottom.Dock = DockStyle.Bottom;
+            bottom.FlowDirection = FlowDirection.RightToLeft;
+            bottom.AutoSize = true;
+            bottom.Padding = new Padding((int)(8 * S));
+
+            var close = new Button();
+            close.Text = "Close";
+            close.AutoSize = true;
+            close.Click += delegate { Close(); };
+            var copy = new Button();
+            copy.Text = "Copy";
+            copy.AutoSize = true;
+            var note = new Label();
+            note.AutoSize = true;
+            note.ForeColor = Color.FromArgb(85, 112, 128);
+            note.Margin = new Padding(3, (int)(8 * S), (int)(12 * S), 3);
+            note.Text = "Copied to the clipboard. Paste it into your Google Doc with Ctrl+V.";
+            copy.Click += delegate
+            {
+                try { Clipboard.SetText(tb.Text.Length > 0 ? tb.Text : " "); note.Text = "Copied again, including your edits."; } catch { }
+            };
+            bottom.Controls.Add(close);
+            bottom.Controls.Add(copy);
+            bottom.Controls.Add(note);
+
+            Controls.Add(holder);
+            Controls.Add(bottom);
+            AcceptButton = copy;
+        }
+    }
+
+    // ------------------------------------------------------------------ main window
+    class MainForm : Form
+    {
+        public const string AppTitle = "KonaSnap";
+        public static MainForm Instance;
+        public static string CaptureDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "KonaSnap");
+        const int HK_PRTSC = 1, HK_CTRLSHIFTX = 2, HK_TEXT = 3;
+        bool busy;
+        Button regionBtn, textBtn;
+        public float S = 1f; // DPI scale
+
+        public MainForm()
+        {
+            Instance = this;
+            using (var g = CreateGraphics()) S = g.DpiX / 96f;
+            Text = AppTitle;
+            Font = new Font("Segoe UI", 10f);
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            BackColor = Color.White;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
+            var flow = new FlowLayoutPanel();
+            flow.FlowDirection = FlowDirection.TopDown;
+            flow.WrapContents = false;
+            flow.AutoSize = true;
+            flow.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            flow.Padding = new Padding((int)(14 * S));
+            flow.Location = new Point(0, 0);
+
+            var title = new Label();
+            title.Text = "KonaSnap";
+            title.Font = new Font("Segoe UI Semibold", 15f);
+            title.ForeColor = Color.FromArgb(11, 79, 108);
+            title.AutoSize = true;
+            title.Margin = new Padding(3, 0, 3, (int)(8 * S));
+            flow.Controls.Add(title);
+
+            regionBtn = Btn("Capture area or window", delegate { StartCapture(0, false); }, true);
+            flow.Controls.Add(regionBtn);
+            textBtn = Btn("Grab text from screen", delegate { StartCapture(0, false, true); }, false);
+            flow.Controls.Add(textBtn);
+            flow.Controls.Add(Btn("Capture full screen", delegate { StartCapture(0, true); }, false));
+            flow.Controls.Add(Btn("Capture in 3 seconds", delegate { StartCapture(3000, false); }, false));
+            flow.Controls.Add(Btn("Open captures folder", delegate { OpenFolder(); }, false));
+
+            var tip = new Label();
+            tip.AutoSize = true;
+            tip.MaximumSize = new Size((int)(340 * S), 0);
+            tip.ForeColor = Color.FromArgb(85, 112, 128);
+            tip.Margin = new Padding(3, (int)(10 * S), 3, 3);
+            tip.Text = "Drag to capture an area, or click a window to capture it. Esc cancels.\nEvery capture is copied to the clipboard and saved in Pictures\\KonaSnap.";
+            flow.Controls.Add(tip);
+
+            Controls.Add(flow);
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        }
+
+        Button Btn(string text, EventHandler click, bool primary)
+        {
+            var b = new Button();
+            b.Text = text;
+            b.Width = (int)(340 * S);
+            b.Height = (int)(42 * S);
+            b.TextAlign = ContentAlignment.MiddleLeft;
+            b.Padding = new Padding((int)(8 * S), 0, 0, 0);
+            b.FlatStyle = FlatStyle.Flat;
+            b.Cursor = Cursors.Hand;
+            b.Margin = new Padding(3, 3, 3, (int)(6 * S));
+            if (primary)
+            {
+                b.BackColor = Color.FromArgb(11, 79, 108);
+                b.ForeColor = Color.White;
+                b.FlatAppearance.BorderColor = Color.FromArgb(11, 79, 108);
+                b.Font = new Font("Segoe UI Semibold", 10.5f);
+            }
+            else
+            {
+                b.BackColor = Color.FromArgb(240, 247, 250);
+                b.ForeColor = Color.FromArgb(14, 39, 51);
+                b.FlatAppearance.BorderColor = Color.FromArgb(205, 228, 236);
+            }
+            b.Click += click;
+            return b;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            var keys = new List<string>();
+            if (Native.RegisterHotKey(Handle, HK_PRTSC, 0x4000, 0x2C)) keys.Add("PrtScn");
+            if (Native.RegisterHotKey(Handle, HK_CTRLSHIFTX, 0x0002 | 0x0004 | 0x4000, (uint)Keys.X)) keys.Add("Ctrl+Shift+X");
+            if (keys.Count > 0) regionBtn.Text = "Capture area or window   (" + string.Join(" or ", keys.ToArray()) + ")";
+            if (Native.RegisterHotKey(Handle, HK_TEXT, 0x0002 | 0x0001 | 0x4000, (uint)Keys.T)) textBtn.Text = "Grab text from screen   (Ctrl+Alt+T)";
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x0312)
+            {
+                if (m.WParam.ToInt32() == HK_TEXT) StartCapture(0, false, true);
+                else StartCapture(0, false);
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            foreach (Form f in new List<Form>(EnumerateForms()))
+            {
+                var ed = f as EditorForm;
+                if (ed != null) ed.SaveIfDirty();
+            }
+            Native.UnregisterHotKey(Handle, HK_PRTSC);
+            Native.UnregisterHotKey(Handle, HK_CTRLSHIFTX);
+            Native.UnregisterHotKey(Handle, HK_TEXT);
+            base.OnFormClosing(e);
+        }
+
+        static IEnumerable<Form> EnumerateForms()
+        {
+            var list = new List<Form>();
+            foreach (Form f in Application.OpenForms) list.Add(f);
+            return list;
+        }
+
+        void OpenFolder()
+        {
+            Directory.CreateDirectory(CaptureDir);
+            System.Diagnostics.Process.Start("explorer.exe", "\"" + CaptureDir + "\"");
+        }
+
+        public void StartCapture(int delayMs, bool full)
+        {
+            StartCapture(delayMs, full, false);
+        }
+
+        public void StartCapture(int delayMs, bool full, bool textOnly)
+        {
+            if (busy) return;
+            busy = true;
+            var hidden = new List<Form>();
+            foreach (Form f in EnumerateForms())
+                if (f.Visible && !(f is RegionForm)) { hidden.Add(f); f.Hide(); }
+            var t = new System.Windows.Forms.Timer();
+            t.Interval = Math.Max(300, delayMs);
+            t.Tick += delegate
+            {
+                t.Stop();
+                t.Dispose();
+                EditorForm editor = null;
+                try { editor = DoCapture(full, textOnly); }
+                catch (Exception ex) { MessageBox.Show("Capture failed: " + ex.Message, AppTitle); }
+                foreach (var f in hidden) if (!f.IsDisposed) f.Show();
+                if (editor != null) { editor.Show(); editor.Activate(); }
+                busy = false;
+            };
+            t.Start();
+        }
+
+        EditorForm DoCapture(bool full, bool textOnly)
+        {
+            Rectangle vs = SystemInformation.VirtualScreen;
+            var shot = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(shot))
+                g.CopyFromScreen(vs.Left, vs.Top, 0, 0, vs.Size, CopyPixelOperation.SourceCopy);
+
+            Rectangle sel;
+            if (full)
+            {
+                var b = Screen.FromPoint(Cursor.Position).Bounds;
+                sel = new Rectangle(b.X - vs.X, b.Y - vs.Y, b.Width, b.Height);
+            }
+            else
+            {
+                var wins = Native.VisibleWindowRects();
+                using (var rf = new RegionForm(shot, vs, wins))
+                {
+                    if (rf.ShowDialog() != DialogResult.OK) { shot.Dispose(); return null; }
+                    sel = rf.Selection;
+                }
+            }
+            sel.Intersect(new Rectangle(0, 0, vs.Width, vs.Height));
+            if (sel.Width < 2 || sel.Height < 2) { shot.Dispose(); return null; }
+
+            Bitmap img = shot.Clone(sel, PixelFormat.Format32bppArgb);
+            shot.Dispose();
+            if (textOnly)
+            {
+                float s = S;
+                Ocr.RunAsync(this, img, delegate(string text, string err) { Ocr.ShowResult(text, err, s); });
+                return null;
+            }
+            string path = SaveNew(img);
+            try { Clipboard.SetImage(img); } catch { }
+            return new EditorForm(img, path);
+        }
+
+        static string SaveNew(Bitmap img)
+        {
+            Directory.CreateDirectory(CaptureDir);
+            string baseName = "Capture " + DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss");
+            string path = Path.Combine(CaptureDir, baseName + ".png");
+            int n = 2;
+            while (File.Exists(path)) { path = Path.Combine(CaptureDir, baseName + " (" + n + ").png"); n++; }
+            img.Save(path, ImageFormat.Png);
+            return path;
+        }
+    }
+
+    // ------------------------------------------------------------------ area / window picker
+    class RegionForm : Form
+    {
+        readonly Bitmap shot;
+        Bitmap dim;
+        readonly Rectangle vs;
+        readonly List<Rectangle> wins = new List<Rectangle>();
+        readonly List<Rectangle> screens = new List<Rectangle>();
+        Point start;
+        bool dragging;
+        Rectangle drag, hover;
+        public Rectangle Selection;
+        static readonly Color Accent = Color.FromArgb(0, 174, 239);
+        readonly Font labelFont = new Font("Segoe UI Semibold", 10f);
+
+        public RegionForm(Bitmap shot, Rectangle vs, List<Rectangle> winsScreen)
+        {
+            this.shot = shot;
+            this.vs = vs;
+            foreach (var r in winsScreen) { var l = r; l.Offset(-vs.X, -vs.Y); wins.Add(l); }
+            foreach (var s in Screen.AllScreens) { var b = s.Bounds; b.Offset(-vs.X, -vs.Y); screens.Add(b); }
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            KeyPreview = true;
+            Cursor = Cursors.Cross;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            Bounds = vs;
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            Bounds = vs;
+            dim = new Bitmap(shot);
+            using (var g = Graphics.FromImage(dim))
+            using (var b = new SolidBrush(Color.FromArgb(105, 0, 0, 0)))
+                g.FillRectangle(b, 0, 0, dim.Width, dim.Height);
+            hover = WindowAt(PointToClient(Cursor.Position));
+            Activate();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { if (dim != null) dim.Dispose(); labelFont.Dispose(); }
+            base.Dispose(disposing);
+        }
+
+        Rectangle Current { get { return dragging ? drag : hover; } }
+
+        static Rectangle Norm(Point a, Point b)
+        {
+            return Rectangle.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+        }
+
+        Rectangle WindowAt(Point p)
+        {
+            var all = new Rectangle(0, 0, vs.Width, vs.Height);
+            foreach (var w in wins) if (w.Contains(p)) return Rectangle.Intersect(w, all);
+            foreach (var s in screens) if (s.Contains(p)) return s;
+            return Rectangle.Empty;
+        }
+
+        void Dirty(Rectangle r)
+        {
+            if (r.Width <= 0 && r.Height <= 0) return;
+            r.Inflate(170, 60);
+            Invalidate(r);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            var clip = e.ClipRectangle;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(dim, clip, clip, GraphicsUnit.Pixel);
+
+            var r = Current;
+            if (r.Width > 0 && r.Height > 0)
+            {
+                var vis = Rectangle.Intersect(r, clip);
+                if (vis.Width > 0 && vis.Height > 0) g.DrawImage(shot, vis, vis, GraphicsUnit.Pixel);
+                using (var p = new Pen(Accent, 2)) g.DrawRectangle(p, r.X, r.Y, r.Width - 1, r.Height - 1);
+                string label = r.Width + " x " + r.Height;
+                var sz = g.MeasureString(label, labelFont);
+                int lx = r.X, ly = r.Y - (int)sz.Height - 10;
+                if (ly < 0) ly = r.Y + 6;
+                var box = new Rectangle(lx, ly, (int)sz.Width + 12, (int)sz.Height + 4);
+                using (var b = new SolidBrush(Accent)) g.FillRectangle(b, box);
+                g.DrawString(label, labelFont, Brushes.White, lx + 6, ly + 2);
+            }
+
+            // hint banner at the top of each screen
+            string hint = "Drag to capture an area  •  Click a window  •  Esc to cancel";
+            foreach (var s in screens)
+            {
+                var sz = g.MeasureString(hint, labelFont);
+                var box = new Rectangle(s.X + (s.Width - (int)sz.Width) / 2 - 14, s.Y + 18, (int)sz.Width + 28, (int)sz.Height + 12);
+                if (!box.IntersectsWith(clip)) continue;
+                using (var b = new SolidBrush(Color.FromArgb(220, 11, 79, 108))) g.FillRectangle(b, box);
+                g.DrawString(hint, labelFont, Brushes.White, box.X + 14, box.Y + 6);
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right) { DialogResult = DialogResult.Cancel; return; }
+            if (e.Button != MouseButtons.Left) return;
+            Dirty(Current);
+            start = e.Location;
+            dragging = true;
+            drag = new Rectangle(e.Location, Size.Empty);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            var old = Current;
+            if (dragging) drag = Norm(start, e.Location);
+            else hover = WindowAt(e.Location);
+            if (old != Current) { Dirty(old); Dirty(Current); }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (!dragging || e.Button != MouseButtons.Left) return;
+            dragging = false;
+            var r = Norm(start, e.Location);
+            if (r.Width < 5 && r.Height < 5) r = WindowAt(e.Location);
+            if (r.Width < 2 || r.Height < 2) { Invalidate(); return; }
+            Selection = r;
+            DialogResult = DialogResult.OK;
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) DialogResult = DialogResult.Cancel;
+            else if (e.KeyCode == Keys.Enter && hover.Width > 1) { Selection = hover; DialogResult = DialogResult.OK; }
+            base.OnKeyDown(e);
+        }
+    }
+
+    // ------------------------------------------------------------------ annotations
+    abstract class Ann
+    {
+        public Color C;
+        public float W;
+        public abstract void Draw(Graphics g, Bitmap baseImg);
+        protected static Color Shadow { get { return Color.FromArgb(70, 0, 0, 0); } }
+    }
+
+    class ArrowAnn : Ann
+    {
+        public Point A, B;
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            if (A == B) return;
+            using (var p = new Pen(Shadow, W))
+            {
+                p.StartCap = LineCap.Round;
+                p.CustomEndCap = new AdjustableArrowCap(3.2f, 3.6f, true);
+                g.DrawLine(p, A.X + 2, A.Y + 2, B.X + 2, B.Y + 2);
+            }
+            using (var p = new Pen(C, W))
+            {
+                p.StartCap = LineCap.Round;
+                p.CustomEndCap = new AdjustableArrowCap(3.2f, 3.6f, true);
+                g.DrawLine(p, A, B);
+            }
+        }
+    }
+
+    class BoxAnn : Ann
+    {
+        public Rectangle R;
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            using (var p = new Pen(Shadow, W)) { p.LineJoin = LineJoin.Round; g.DrawRectangle(p, R.X + 2, R.Y + 2, R.Width, R.Height); }
+            using (var p = new Pen(C, W)) { p.LineJoin = LineJoin.Round; g.DrawRectangle(p, R); }
+        }
+    }
+
+    class HighlightAnn : Ann
+    {
+        public Rectangle R;
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            using (var b = new SolidBrush(Color.FromArgb(105, 255, 230, 0))) g.FillRectangle(b, R);
+        }
+    }
+
+    class PenAnn : Ann
+    {
+        public List<Point> Pts = new List<Point>();
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            if (Pts.Count < 2) return;
+            using (var p = new Pen(C, W))
+            {
+                p.StartCap = LineCap.Round; p.EndCap = LineCap.Round; p.LineJoin = LineJoin.Round;
+                g.DrawLines(p, Pts.ToArray());
+            }
+        }
+    }
+
+    class TextAnn : Ann
+    {
+        public Point P;
+        public string S;
+        public static float PxFor(float w) { return 14f + w * 3.5f; }
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            using (var f = new Font("Segoe UI", PxFor(W), FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                var sz = g.MeasureString(S, f);
+                var box = new RectangleF(P.X, P.Y, sz.Width + 14, sz.Height + 8);
+                using (var b = new SolidBrush(Color.FromArgb(240, 255, 255, 255))) g.FillRectangle(b, box);
+                using (var p = new Pen(C, 2)) g.DrawRectangle(p, box.X, box.Y, box.Width, box.Height);
+                using (var b = new SolidBrush(C)) g.DrawString(S, f, b, P.X + 7, P.Y + 4);
+            }
+        }
+    }
+
+    class StepAnn : Ann
+    {
+        public Point P;
+        public int N;
+        public static float DiaFor(float w) { return 26f + w * 3f; }
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            float d = DiaFor(W);
+            var r = new RectangleF(P.X - d / 2, P.Y - d / 2, d, d);
+            using (var b = new SolidBrush(Shadow)) g.FillEllipse(b, r.X + 2, r.Y + 2, d, d);
+            using (var b = new SolidBrush(C)) g.FillEllipse(b, r);
+            using (var p = new Pen(Color.White, 2)) g.DrawEllipse(p, r);
+            using (var f = new Font("Segoe UI", d * 0.5f, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var sf = new StringFormat())
+            {
+                sf.Alignment = StringAlignment.Center;
+                sf.LineAlignment = StringAlignment.Center;
+                g.DrawString(N.ToString(), f, Brushes.White, r, sf);
+            }
+        }
+    }
+
+    class BlurAnn : Ann
+    {
+        public Rectangle R;
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            var r = Rectangle.Intersect(R, new Rectangle(0, 0, baseImg.Width, baseImg.Height));
+            if (r.Width < 2 || r.Height < 2) return;
+            const int block = 12;
+            int sw = Math.Max(1, r.Width / block), sh = Math.Max(1, r.Height / block);
+            using (var small = new Bitmap(sw, sh))
+            {
+                using (var sg = Graphics.FromImage(small))
+                {
+                    sg.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    sg.DrawImage(baseImg, new Rectangle(0, 0, sw, sh), r, GraphicsUnit.Pixel);
+                }
+                var st = g.Save();
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+                g.DrawImage(small, r, new Rectangle(0, 0, sw, sh), GraphicsUnit.Pixel);
+                g.Restore(st);
+            }
+        }
+    }
+
+    class CropAnn : Ann
+    {
+        public Rectangle R;
+        public override void Draw(Graphics g, Bitmap baseImg)
+        {
+            using (var b = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
+            {
+                var all = new Region(new Rectangle(0, 0, baseImg.Width, baseImg.Height));
+                all.Exclude(R);
+                g.FillRegion(b, all);
+                all.Dispose();
+            }
+            using (var p = new Pen(Color.White, 2)) { p.DashStyle = DashStyle.Dash; g.DrawRectangle(p, R); }
+        }
+    }
+
+    // ------------------------------------------------------------------ editor
+    class Canvas : Panel
+    {
+        public Canvas()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+    }
+
+    class EditorForm : Form
+    {
+        enum Tool { Arrow, Box, Highlight, Pen, Text, Step, Blur, Crop }
+        class State { public Bitmap Img; public List<Ann> Anns; }
+
+        Bitmap img;
+        string path;
+        List<Ann> anns = new List<Ann>();
+        readonly Stack<State> undo = new Stack<State>();
+        readonly Stack<State> redo = new Stack<State>();
+        Tool tool = Tool.Arrow;
+        Color color = Color.FromArgb(215, 38, 30);
+        float width = 4f;
+        float zoom = 1f;
+        bool dirty;
+        Ann preview;
+        bool mouseDown;
+        Point downPt;
+        TextBox textBox;
+        Point textPos;
+        bool committing;
+
+        readonly Canvas canvas = new Canvas();
+        readonly Panel scroller = new Panel();
+        readonly ToolStrip bar = new ToolStrip();
+        readonly StatusStrip statusStrip = new StatusStrip();
+        readonly ToolStripStatusLabel status = new ToolStripStatusLabel();
+        readonly ToolStripStatusLabel zoomLabel = new ToolStripStatusLabel();
+        readonly Dictionary<Tool, ToolStripButton> toolButtons = new Dictionary<Tool, ToolStripButton>();
+        ToolStripDropDownButton colorBtn, widthBtn;
+        readonly float S;
+
+        public EditorForm(Bitmap image, string savedPath)
+        {
+            img = image;
+            path = savedPath;
+            S = MainForm.Instance != null ? MainForm.Instance.S : 1f;
+            Text = "KonaSnap - " + Path.GetFileName(path);
+            Font = new Font("Segoe UI", 9.5f);
+            KeyPreview = true;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
+            BuildToolbar();
+
+            status.Spring = true;
+            status.TextAlign = ContentAlignment.MiddleLeft;
+            status.Text = "Copied to clipboard and saved to " + path;
+            statusStrip.Items.Add(status);
+            statusStrip.Items.Add(zoomLabel);
+
+            scroller.Dock = DockStyle.Fill;
+            scroller.AutoScroll = true;
+            scroller.BackColor = Color.FromArgb(52, 58, 64);
+            scroller.Controls.Add(canvas);
+            scroller.Resize += delegate { CenterCanvas(); };
+            scroller.MouseWheel += OnWheel;
+
+            canvas.BackColor = Color.White;
+            canvas.Cursor = Cursors.Cross;
+            canvas.Paint += delegate(object s, PaintEventArgs e) { PaintCanvas(e.Graphics); };
+            canvas.MouseDown += OnDown;
+            canvas.MouseMove += OnMove;
+            canvas.MouseUp += OnUp;
+            canvas.MouseWheel += OnWheel;
+
+            Controls.Add(scroller);
+            Controls.Add(bar);
+            Controls.Add(statusStrip);
+
+            var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int w = Math.Min(wa.Width - 80, Math.Max((int)(900 * S), img.Width + (int)(60 * S)));
+            int h = Math.Min(wa.Height - 80, Math.Max((int)(600 * S), img.Height + (int)(160 * S)));
+            StartPosition = FormStartPosition.Manual;
+            Bounds = new Rectangle(wa.X + (wa.Width - w) / 2, wa.Y + (wa.Height - h) / 2, w, h);
+            Shown += delegate { ZoomFit(); };
+            SelectTool(Tool.Arrow);
+        }
+
+        // ---------------- toolbar
+        void BuildToolbar()
+        {
+            bar.GripStyle = ToolStripGripStyle.Hidden;
+            bar.Padding = new Padding((int)(6 * S), (int)(4 * S), 0, (int)(4 * S));
+            bar.ImageScalingSize = new Size((int)(16 * S), (int)(16 * S));
+            bar.Font = new Font("Segoe UI", 9.5f);
+            bar.RenderMode = ToolStripRenderMode.System;
+
+            AddTool(Tool.Arrow, "Arrow", "Arrow (A)");
+            AddTool(Tool.Box, "Box", "Rectangle (R)");
+            AddTool(Tool.Highlight, "Highlight", "Highlighter (H)");
+            AddTool(Tool.Pen, "Pen", "Freehand pen (P)");
+            AddTool(Tool.Text, "Text", "Text label (T)");
+            AddTool(Tool.Step, "Step", "Numbered step (N)");
+            AddTool(Tool.Blur, "Blur", "Blur / pixelate (B)");
+            AddTool(Tool.Crop, "Crop", "Crop (C)");
+            bar.Items.Add(new ToolStripSeparator());
+
+            colorBtn = new ToolStripDropDownButton("Color");
+            colorBtn.ToolTipText = "Color";
+            var palette = new Color[] {
+                Color.FromArgb(215, 38, 30), Color.FromArgb(245, 124, 0), Color.FromArgb(255, 214, 0), Color.FromArgb(46, 160, 67),
+                Color.FromArgb(0, 174, 239), Color.FromArgb(11, 79, 108), Color.FromArgb(142, 68, 173), Color.Black, Color.White };
+            var names = new string[] { "Red", "Orange", "Yellow", "Green", "Aqua", "Ocean blue", "Purple", "Black", "White" };
+            for (int i = 0; i < palette.Length; i++)
+            {
+                var c = palette[i];
+                var item = new ToolStripMenuItem(names[i], Swatch(c));
+                item.Click += delegate { SetColor(c); };
+                colorBtn.DropDownItems.Add(item);
+            }
+            var more = new ToolStripMenuItem("More colors...");
+            more.Click += delegate
+            {
+                using (var cd = new ColorDialog()) { cd.Color = color; cd.FullOpen = true; if (cd.ShowDialog(this) == DialogResult.OK) SetColor(cd.Color); }
+            };
+            colorBtn.DropDownItems.Add(more);
+            bar.Items.Add(colorBtn);
+
+            widthBtn = new ToolStripDropDownButton("Size: 4");
+            foreach (int v in new int[] { 2, 4, 6, 10 })
+            {
+                int vv = v;
+                var item = new ToolStripMenuItem(vv == 2 ? "Thin (2)" : vv == 4 ? "Medium (4)" : vv == 6 ? "Thick (6)" : "Extra thick (10)");
+                item.Click += delegate { width = vv; widthBtn.Text = "Size: " + vv; };
+                widthBtn.DropDownItems.Add(item);
+            }
+            bar.Items.Add(widthBtn);
+            bar.Items.Add(new ToolStripSeparator());
+
+            AddAction("Undo", "Undo (Ctrl+Z)", delegate { Undo(); });
+            AddAction("Redo", "Redo (Ctrl+Y)", delegate { Redo(); });
+            bar.Items.Add(new ToolStripSeparator());
+            AddAction("Copy", "Copy to clipboard (Ctrl+C)", delegate { CopyToClipboard(); });
+            AddAction("Copy Text", "Read the text in this image and copy it (Ctrl+Shift+C)", delegate { CopyText(); });
+            AddAction("Save", "Save (Ctrl+S)", delegate { Save(); });
+            AddAction("Save As...", "Save a copy as PNG or JPG", delegate { SaveAs(); });
+            bar.Items.Add(new ToolStripSeparator());
+            AddAction("Fit", "Zoom to fit (Ctrl+0)", delegate { ZoomFit(); });
+            AddAction("100%", "Actual size (Ctrl+1)", delegate { SetZoom(1f); });
+            bar.Items.Add(new ToolStripSeparator());
+            AddAction("New Capture", "Take a new capture (Ctrl+N)", delegate { if (MainForm.Instance != null) MainForm.Instance.StartCapture(0, false); });
+            SetColor(color);
+        }
+
+        Bitmap Swatch(Color c)
+        {
+            int s = (int)(16 * S);
+            var b = new Bitmap(s, s);
+            using (var g = Graphics.FromImage(b))
+            {
+                using (var br = new SolidBrush(c)) g.FillRectangle(br, 0, 0, s - 1, s - 1);
+                g.DrawRectangle(Pens.Gray, 0, 0, s - 1, s - 1);
+            }
+            return b;
+        }
+
+        void AddTool(Tool t, string text, string tip)
+        {
+            var b = new ToolStripButton(text);
+            b.ToolTipText = tip;
+            b.Click += delegate { SelectTool(t); };
+            toolButtons[t] = b;
+            bar.Items.Add(b);
+        }
+
+        void AddAction(string text, string tip, EventHandler click)
+        {
+            var b = new ToolStripButton(text);
+            b.ToolTipText = tip;
+            b.Click += click;
+            bar.Items.Add(b);
+        }
+
+        void SetColor(Color c)
+        {
+            color = c;
+            var old = colorBtn.Image;
+            colorBtn.Image = Swatch(c);
+            colorBtn.DisplayStyle = ToolStripItemDisplayStyle.ImageAndText;
+            if (old != null) old.Dispose();
+        }
+
+        void SelectTool(Tool t)
+        {
+            CommitText();
+            if (preview is CropAnn) { preview = null; canvas.Invalidate(); }
+            tool = t;
+            foreach (var kv in toolButtons) kv.Value.Checked = kv.Key == t;
+            canvas.Cursor = t == Tool.Text ? Cursors.IBeam : Cursors.Cross;
+            string hint = "";
+            switch (t)
+            {
+                case Tool.Arrow: hint = "Drag to draw an arrow."; break;
+                case Tool.Box: hint = "Drag to draw a box."; break;
+                case Tool.Highlight: hint = "Drag over an area to highlight it."; break;
+                case Tool.Pen: hint = "Drag to draw freehand."; break;
+                case Tool.Text: hint = "Click where the label goes, type, then press Enter."; break;
+                case Tool.Step: hint = "Click to drop numbered steps: 1, 2, 3..."; break;
+                case Tool.Blur: hint = "Drag over anything private to pixelate it."; break;
+                case Tool.Crop: hint = "Drag the area to keep."; break;
+            }
+            status.Text = hint;
+        }
+
+        // ---------------- zoom & layout
+        void SetZoom(float z)
+        {
+            zoom = Math.Max(0.1f, Math.Min(8f, z));
+            canvas.Size = new Size(Math.Max(1, (int)(img.Width * zoom)), Math.Max(1, (int)(img.Height * zoom)));
+            zoomLabel.Text = (int)Math.Round(zoom * 100) + "%";
+            CenterCanvas();
+            canvas.Invalidate();
+        }
+
+        void ZoomFit()
+        {
+            int pad = (int)(24 * S);
+            float zx = (scroller.ClientSize.Width - pad) / (float)img.Width;
+            float zy = (scroller.ClientSize.Height - pad) / (float)img.Height;
+            SetZoom(Math.Min(1f, Math.Min(zx, zy)));
+        }
+
+        void CenterCanvas()
+        {
+            int pad = (int)(12 * S);
+            int x = Math.Max(pad, (scroller.ClientSize.Width - canvas.Width) / 2);
+            int y = Math.Max(pad, (scroller.ClientSize.Height - canvas.Height) / 2);
+            canvas.Location = new Point(x + scroller.AutoScrollPosition.X, y + scroller.AutoScrollPosition.Y);
+        }
+
+        void OnWheel(object sender, MouseEventArgs e)
+        {
+            if ((ModifierKeys & Keys.Control) == 0) return;
+            SetZoom(e.Delta > 0 ? zoom * 1.25f : zoom / 1.25f);
+            var hme = e as HandledMouseEventArgs;
+            if (hme != null) hme.Handled = true;
+        }
+
+        // ---------------- painting
+        void PaintCanvas(Graphics g)
+        {
+            g.ScaleTransform(zoom, zoom);
+            g.InterpolationMode = zoom < 1f ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(img, 0, 0, img.Width, img.Height);
+            g.PixelOffsetMode = PixelOffsetMode.Default;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            foreach (var a in anns) a.Draw(g, img);
+            if (preview != null) preview.Draw(g, img);
+        }
+
+        Bitmap Render()
+        {
+            var b = new Bitmap(img.Width, img.Height, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(b))
+            {
+                g.DrawImage(img, 0, 0, img.Width, img.Height);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                foreach (var a in anns) a.Draw(g, img);
+            }
+            return b;
+        }
+
+        // ---------------- mouse
+        Point ImgPt(Point p)
+        {
+            return new Point((int)(p.X / zoom), (int)(p.Y / zoom));
+        }
+
+        static Rectangle Norm(Point a, Point b)
+        {
+            return Rectangle.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+        }
+
+        void OnDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if (textBox != null) { CommitText(); return; }
+            downPt = ImgPt(e.Location);
+            switch (tool)
+            {
+                case Tool.Text:
+                    BeginText(e.Location);
+                    return;
+                case Tool.Step:
+                    {
+                        int n = 1;
+                        foreach (var a in anns) if (a is StepAnn) n++;
+                        var s = new StepAnn();
+                        s.P = downPt; s.N = n; s.C = color; s.W = width;
+                        AddAnn(s);
+                        return;
+                    }
+                case Tool.Arrow: { var a = new ArrowAnn(); a.A = downPt; a.B = downPt; preview = a; break; }
+                case Tool.Box: preview = new BoxAnn(); break;
+                case Tool.Highlight: preview = new HighlightAnn(); break;
+                case Tool.Blur: preview = new BlurAnn(); break;
+                case Tool.Crop: preview = new CropAnn(); break;
+                case Tool.Pen: { var p = new PenAnn(); p.Pts.Add(downPt); preview = p; break; }
+            }
+            if (preview != null) { preview.C = color; preview.W = width; }
+            mouseDown = true;
+            canvas.Capture = true;
+        }
+
+        void OnMove(object sender, MouseEventArgs e)
+        {
+            if (!mouseDown || preview == null) return;
+            var p = ImgPt(e.Location);
+            p.X = Math.Max(0, Math.Min(img.Width, p.X));
+            p.Y = Math.Max(0, Math.Min(img.Height, p.Y));
+            var r = Norm(downPt, p);
+            if (preview is ArrowAnn) ((ArrowAnn)preview).B = p;
+            else if (preview is BoxAnn) ((BoxAnn)preview).R = r;
+            else if (preview is HighlightAnn) ((HighlightAnn)preview).R = r;
+            else if (preview is BlurAnn) ((BlurAnn)preview).R = r;
+            else if (preview is CropAnn) ((CropAnn)preview).R = r;
+            else if (preview is PenAnn) ((PenAnn)preview).Pts.Add(p);
+            canvas.Invalidate();
+        }
+
+        void OnUp(object sender, MouseEventArgs e)
+        {
+            if (!mouseDown) return;
+            mouseDown = false;
+            canvas.Capture = false;
+            var a = preview;
+            preview = null;
+            if (a == null) return;
+            if (a is CropAnn) { DoCrop(((CropAnn)a).R); return; }
+            bool ok = true;
+            if (a is ArrowAnn) { var x = (ArrowAnn)a; ok = Math.Abs(x.A.X - x.B.X) + Math.Abs(x.A.Y - x.B.Y) > 4; }
+            else if (a is BoxAnn) ok = ((BoxAnn)a).R.Width > 3 && ((BoxAnn)a).R.Height > 3;
+            else if (a is HighlightAnn) ok = ((HighlightAnn)a).R.Width > 3 && ((HighlightAnn)a).R.Height > 3;
+            else if (a is BlurAnn) ok = ((BlurAnn)a).R.Width > 3 && ((BlurAnn)a).R.Height > 3;
+            else if (a is PenAnn) ok = ((PenAnn)a).Pts.Count > 1;
+            if (ok) AddAnn(a); else canvas.Invalidate();
+        }
+
+        // ---------------- text entry
+        void BeginText(Point screenPt)
+        {
+            textPos = ImgPt(screenPt);
+            textBox = new TextBox();
+            textBox.BorderStyle = BorderStyle.FixedSingle;
+            textBox.Font = new Font("Segoe UI", Math.Max(8f, TextAnn.PxFor(width) * zoom), FontStyle.Bold, GraphicsUnit.Pixel);
+            textBox.ForeColor = color;
+            textBox.Location = screenPt;
+            textBox.Width = (int)(320 * S);
+            textBox.KeyDown += delegate(object s, KeyEventArgs ke)
+            {
+                if (ke.KeyCode == Keys.Enter) { ke.SuppressKeyPress = true; CommitText(); }
+                else if (ke.KeyCode == Keys.Escape) { ke.SuppressKeyPress = true; CancelText(); }
+            };
+            textBox.LostFocus += delegate { CommitText(); };
+            canvas.Controls.Add(textBox);
+            textBox.Focus();
+            status.Text = "Type your label, then press Enter. Esc cancels.";
+        }
+
+        void CommitText()
+        {
+            if (textBox == null || committing) return;
+            committing = true;
+            string s = textBox.Text.Trim();
+            var tb = textBox;
+            textBox = null;
+            canvas.Controls.Remove(tb);
+            tb.Dispose();
+            if (s.Length > 0)
+            {
+                var t = new TextAnn();
+                t.P = textPos; t.S = s; t.C = color; t.W = width;
+                AddAnn(t);
+            }
+            committing = false;
+            canvas.Focus();
+        }
+
+        void CancelText()
+        {
+            if (textBox == null) return;
+            committing = true;
+            var tb = textBox;
+            textBox = null;
+            canvas.Controls.Remove(tb);
+            tb.Dispose();
+            committing = false;
+        }
+
+        // ---------------- edits, undo
+        State Snapshot()
+        {
+            var s = new State();
+            s.Img = img;
+            s.Anns = new List<Ann>(anns);
+            return s;
+        }
+
+        void Restore(State s)
+        {
+            img = s.Img;
+            anns = new List<Ann>(s.Anns);
+            SetZoom(zoom);
+        }
+
+        void AddAnn(Ann a)
+        {
+            undo.Push(Snapshot());
+            redo.Clear();
+            anns.Add(a);
+            dirty = true;
+            canvas.Invalidate();
+        }
+
+        void DoCrop(Rectangle r)
+        {
+            r.Intersect(new Rectangle(0, 0, img.Width, img.Height));
+            if (r.Width < 4 || r.Height < 4) { canvas.Invalidate(); return; }
+            undo.Push(Snapshot());
+            redo.Clear();
+            using (var flat = Render()) img = flat.Clone(r, PixelFormat.Format32bppArgb);
+            anns = new List<Ann>();
+            dirty = true;
+            ZoomFit();
+            status.Text = "Cropped to " + r.Width + " x " + r.Height + ". Undo brings it back.";
+        }
+
+        void Undo()
+        {
+            CommitText();
+            if (undo.Count == 0) return;
+            redo.Push(Snapshot());
+            Restore(undo.Pop());
+            dirty = true;
+        }
+
+        void Redo()
+        {
+            if (redo.Count == 0) return;
+            undo.Push(Snapshot());
+            Restore(redo.Pop());
+            dirty = true;
+        }
+
+        // ---------------- output
+        void CopyToClipboard()
+        {
+            CommitText();
+            using (var b = Render())
+            {
+                try { Clipboard.SetImage(b); status.Text = "Copied to clipboard. Paste it anywhere with Ctrl+V."; }
+                catch (Exception ex) { status.Text = "Couldn't copy: " + ex.Message; }
+            }
+        }
+
+        bool reading;
+        void CopyText()
+        {
+            CommitText();
+            if (reading) return;
+            reading = true;
+            status.Text = "Reading text...";
+            UseWaitCursor = true;
+            Ocr.RunAsync(this, Render(), delegate(string text, string err)
+            {
+                reading = false;
+                UseWaitCursor = false;
+                status.Text = text.Length > 0 ? "Text copied to the clipboard." : (err ?? "No text found.");
+                Ocr.ShowResult(text, err, S);
+            });
+        }
+
+        void Save()
+        {
+            CommitText();
+            try
+            {
+                using (var b = Render()) b.Save(path, ImageFormat.Png);
+                dirty = false;
+                status.Text = "Saved to " + path;
+            }
+            catch (Exception ex) { status.Text = "Couldn't save: " + ex.Message; }
+        }
+
+        public void SaveIfDirty()
+        {
+            if (dirty) Save();
+        }
+
+        void SaveAs()
+        {
+            CommitText();
+            using (var d = new SaveFileDialog())
+            {
+                d.Filter = "PNG image|*.png|JPEG image|*.jpg";
+                d.InitialDirectory = Path.GetDirectoryName(path);
+                d.FileName = Path.GetFileNameWithoutExtension(path);
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                using (var b = Render())
+                {
+                    if (d.FilterIndex == 2)
+                    {
+                        using (var flat = new Bitmap(b.Width, b.Height, PixelFormat.Format24bppRgb))
+                        {
+                            using (var g = Graphics.FromImage(flat)) { g.Clear(Color.White); g.DrawImage(b, 0, 0, b.Width, b.Height); }
+                            flat.Save(d.FileName, ImageFormat.Jpeg);
+                        }
+                    }
+                    else b.Save(d.FileName, ImageFormat.Png);
+                }
+                status.Text = "Saved a copy to " + d.FileName;
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            SaveIfDirty();
+            base.OnFormClosing(e);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (textBox != null) { base.OnKeyDown(e); return; }
+            bool handled = true;
+            if (e.Control && e.Shift && e.KeyCode == Keys.C) CopyText();
+            else if (e.Control && e.KeyCode == Keys.Z) Undo();
+            else if (e.Control && e.KeyCode == Keys.Y) Redo();
+            else if (e.Control && e.KeyCode == Keys.C) CopyToClipboard();
+            else if (e.Control && e.KeyCode == Keys.S) Save();
+            else if (e.Control && e.KeyCode == Keys.N) { if (MainForm.Instance != null) MainForm.Instance.StartCapture(0, false); }
+            else if (e.Control && (e.KeyCode == Keys.D0 || e.KeyCode == Keys.NumPad0)) ZoomFit();
+            else if (e.Control && (e.KeyCode == Keys.D1 || e.KeyCode == Keys.NumPad1)) SetZoom(1f);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.A) SelectTool(Tool.Arrow);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.R) SelectTool(Tool.Box);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.H) SelectTool(Tool.Highlight);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.P) SelectTool(Tool.Pen);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.T) SelectTool(Tool.Text);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.N) SelectTool(Tool.Step);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.B) SelectTool(Tool.Blur);
+            else if (!e.Control && !e.Alt && e.KeyCode == Keys.C) SelectTool(Tool.Crop);
+            else if (e.KeyCode == Keys.Escape && preview != null) { preview = null; mouseDown = false; canvas.Invalidate(); }
+            else handled = false;
+            if (handled) { e.Handled = true; e.SuppressKeyPress = true; }
+            base.OnKeyDown(e);
+        }
+    }
+}
