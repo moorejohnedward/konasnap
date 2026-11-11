@@ -1,5 +1,6 @@
 ﻿// KonaSnap - a simple Snagit-style screen capture and markup tool for Windows.
 // v2: scrolling capture, panels inside windows, full-text grab, new tools and a fresh look.
+// v2.1: in-app updates from GitHub Releases and a crash report that is saved and copied to the clipboard.
 // Build with build.bat (uses the C# compiler that ships with Windows / .NET Framework 4).
 // C# 5 syntax only, so it compiles with the built-in csc.exe.
 
@@ -16,6 +17,12 @@ using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyTitle("KonaSnap")]
+[assembly: System.Reflection.AssemblyProduct("KonaSnap")]
+[assembly: System.Reflection.AssemblyCompany("John Moore")]
+[assembly: System.Reflection.AssemblyVersion("2.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.1.0.0")]
+
 namespace KonaSnap
 {
     static class Program
@@ -26,10 +33,18 @@ namespace KonaSnap
         static void Main(string[] args)
         {
             try { SetProcessDPIAware(); } catch { }
+            Updater.InstallCrashHandlers();
+            Updater.Cleanup();
             string cmd = Taskbar.FindCommand(args);
+            bool justUpdated = Array.Exists(args, delegate(string a) { return a.Equals("--updated", StringComparison.OrdinalIgnoreCase); });
             bool created;
             using (var mutex = new Mutex(true, "KonaSnap_SingleInstance_Mutex", out created))
             {
+                if (!created && justUpdated)
+                {
+                    // the old copy is still closing after an update; wait for it
+                    try { created = mutex.WaitOne(15000); } catch (AbandonedMutexException) { created = true; }
+                }
                 if (!created)
                 {
                     IntPtr h = Native.FindWindow(null, MainForm.AppTitle);
@@ -42,10 +57,269 @@ namespace KonaSnap
                 }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                var main = new MainForm();
+                MainForm main;
+                try { main = new MainForm(); }
+                catch (Exception ex) { Updater.Report(ex, true); return; }
                 main.StartupCommand = cmd;
+                main.JustUpdated = justUpdated;
                 Application.Run(main);
             }
+        }
+    }
+
+    // ---- In-app updates and crash reports (added in v2.1) ----
+    // Updates come from the GitHub Releases page of moorejohnedward/konasnap.
+    // Each release carries KonaSnap.exe and KonaSnap.exe.sha256; the download is checked
+    // against the hash before the running copy is swapped out.
+    static class Updater
+    {
+        public const string Version = "2.1.0";
+        const string Owner = "moorejohnedward", Repo = "konasnap", AssetName = "KonaSnap.exe";
+
+        public class Info { public string Tag, ExeUrl, ShaUrl, Notes, PageUrl; public System.Version Ver; public long Size; }
+
+        public static System.Version Current { get { return new System.Version(Version); } }
+        public static string ExePath { get { return Application.ExecutablePath; } }
+
+        static System.Net.WebClient Client()
+        {
+            try { System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)3072; } catch { } // TLS 1.2
+            var wc = new System.Net.WebClient();
+            wc.Headers[System.Net.HttpRequestHeader.UserAgent] = "KonaSnap/" + Version;
+            wc.Encoding = Encoding.UTF8;
+            return wc;
+        }
+
+        // Removes the previous copy left behind by the last update.
+        public static void Cleanup()
+        {
+            try { string old = ExePath + ".old"; if (File.Exists(old)) File.Delete(old); } catch { }
+            try { string nw = ExePath + ".new"; if (File.Exists(nw)) File.Delete(nw); } catch { }
+        }
+
+        static string JsonString(string json, string key)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+            if (!m.Success) return null;
+            return System.Text.RegularExpressions.Regex.Unescape(m.Groups[1].Value);
+        }
+
+        // Returns null when KonaSnap is up to date. Throws on network errors.
+        public static Info Check()
+        {
+            string json;
+            using (var wc = Client())
+            {
+                wc.Headers[System.Net.HttpRequestHeader.Accept] = "application/vnd.github+json";
+                json = wc.DownloadString("https://api.github.com/repos/" + Owner + "/" + Repo + "/releases/latest");
+            }
+            var info = new Info();
+            info.Tag = JsonString(json, "tag_name");
+            info.Notes = JsonString(json, "body") ?? "";
+            info.PageUrl = JsonString(json, "html_url");
+            if (info.Tag == null) return null;
+            System.Version v;
+            if (!System.Version.TryParse(info.Tag.TrimStart('v', 'V'), out v)) return null;
+            info.Ver = v;
+            // each asset block: "name": "...", ... "size": n, ... "browser_download_url": "..."
+            foreach (System.Text.RegularExpressions.Match a in System.Text.RegularExpressions.Regex.Matches(json,
+                "\"name\"\\s*:\\s*\"([^\"]+)\"[^{}]*?\"size\"\\s*:\\s*(\\d+)[^{}]*?\"browser_download_url\"\\s*:\\s*\"([^\"]+)\""))
+            {
+                string name = a.Groups[1].Value;
+                if (name.Equals(AssetName, StringComparison.OrdinalIgnoreCase)) { info.ExeUrl = a.Groups[3].Value; info.Size = long.Parse(a.Groups[2].Value); }
+                else if (name.Equals(AssetName + ".sha256", StringComparison.OrdinalIgnoreCase)) info.ShaUrl = a.Groups[3].Value;
+            }
+            if (info.ExeUrl == null || info.ShaUrl == null) return null;
+            return v > Current ? info : null;
+        }
+
+        // Downloads, verifies and swaps in the new KonaSnap.exe. Returns true when the swap
+        // is done; the caller then restarts KonaSnap.
+        public static void Install(Info info, Action<int> progress)
+        {
+            string exe = ExePath, nw = exe + ".new", old = exe + ".old";
+            string expected;
+            using (var wc = Client()) expected = wc.DownloadString(info.ShaUrl).Trim().Split(' ', '\t', '\r', '\n')[0].ToLowerInvariant();
+
+            using (var wc = Client())
+            {
+                var done = new ManualResetEvent(false);
+                Exception err = null;
+                wc.DownloadProgressChanged += delegate(object s, System.Net.DownloadProgressChangedEventArgs e) { if (progress != null) progress(e.ProgressPercentage); };
+                wc.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs e) { err = e.Error; done.Set(); };
+                wc.DownloadFileAsync(new Uri(info.ExeUrl), nw);
+                done.WaitOne();
+                if (err != null) throw err;
+            }
+
+            if (info.Size > 0 && new FileInfo(nw).Length != info.Size) { File.Delete(nw); throw new Exception("The download was incomplete. Try again."); }
+            string actual;
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var fs = File.OpenRead(nw))
+                actual = BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+            if (actual != expected) { File.Delete(nw); throw new Exception("The download didn't match its checksum, so it wasn't installed."); }
+
+            if (File.Exists(old)) File.Delete(old);
+            File.Move(exe, old);              // Windows lets a running exe be renamed
+            try { File.Move(nw, exe); }
+            catch { File.Move(old, exe); throw; }
+        }
+
+        public static void Restart()
+        {
+            System.Diagnostics.Process.Start(ExePath, "--updated");
+            Application.Exit();
+        }
+
+        // ---- crash reports
+        public static string LogDir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KonaSnap"); } }
+        public static string CrashLog { get { return Path.Combine(LogDir, "crash.log"); } }
+
+        public static void InstallCrashHandlers()
+        {
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e) { Report(e.Exception, false); };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { Report(e.ExceptionObject as Exception, true); };
+        }
+
+        static bool reporting;
+        public static void Report(Exception ex, bool fatal)
+        {
+            if (reporting) return;
+            reporting = true;
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("KonaSnap " + Version + " crash report, " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                sb.AppendLine("Windows " + Environment.OSVersion.VersionString + (Environment.Is64BitProcess ? ", 64-bit" : ", 32-bit") + ", .NET " + Environment.Version);
+                sb.AppendLine("Running from: " + ExePath);
+                sb.AppendLine(ex == null ? "(no exception details)" : ex.ToString());
+                sb.AppendLine(new string('-', 60));
+                string text = sb.ToString();
+                try { Directory.CreateDirectory(LogDir); File.AppendAllText(CrashLog, text); } catch { }
+                try { Clipboard.SetText(text); } catch { }
+                MessageBox.Show(
+                    "KonaSnap ran into a problem" + (fatal ? " and has to close." : ". It will try to keep going.") + "\n\n" +
+                    (ex == null ? "" : ex.GetType().Name + ": " + ex.Message + "\n\n") +
+                    "The full details are copied to your clipboard and saved in:\n" + CrashLog + "\n\nPaste them to Claude to get it fixed.",
+                    "KonaSnap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            catch { }
+            finally { reporting = false; }
+        }
+    }
+
+    // Small "Check for updates" window.
+    class UpdateForm : Form
+    {
+        readonly Label msg;
+        readonly ProgressBar bar;
+        readonly Button go, close;
+        Updater.Info info;
+
+        public UpdateForm(Updater.Info found)
+        {
+            Text = "KonaSnap updates";
+            Font = new Font("Segoe UI", 10f);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            BackColor = Color.White;
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(440, 230);
+
+            msg = new Label();
+            msg.Location = new Point(16, 14);
+            msg.Size = new Size(408, 140);
+            msg.ForeColor = Theme.Ink;
+            Controls.Add(msg);
+
+            bar = new ProgressBar();
+            bar.Location = new Point(16, 158);
+            bar.Size = new Size(408, 14);
+            bar.Visible = false;
+            Controls.Add(bar);
+
+            go = new Button();
+            go.Text = "Update now";
+            go.Size = new Size(120, 32);
+            go.Location = new Point(196, 186);
+            go.Enabled = false;
+            go.Click += delegate { DoInstall(); };
+            Controls.Add(go);
+
+            close = new Button();
+            close.Text = "Close";
+            close.Size = new Size(100, 32);
+            close.Location = new Point(324, 186);
+            close.Click += delegate { Close(); };
+            Controls.Add(close);
+            AcceptButton = go;
+            CancelButton = close;
+
+            if (found != null) ShowRelease(found);
+            else Shown += delegate { RunCheck(); };
+        }
+
+        void ShowRelease(Updater.Info found)
+        {
+            info = found;
+            string notes = (found.Notes ?? "").Trim();
+            if (notes.Length > 420) notes = notes.Substring(0, 420) + "...";
+            msg.Text = "KonaSnap " + found.Ver + " is ready (you have " + Updater.Version + ").\n\n" + notes;
+            go.Enabled = true;
+            go.Focus();
+        }
+
+        void RunCheck()
+        {
+            msg.Text = "Checking for a newer KonaSnap...";
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Updater.Info r = null; Exception err = null;
+                try { r = Updater.Check(); } catch (Exception ex) { err = ex; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (err != null) msg.Text = "Couldn't reach the update server.\n\n" + err.Message;
+                        else if (r == null) msg.Text = "You have the latest KonaSnap (" + Updater.Version + ").";
+                        else ShowRelease(r);
+                    });
+                }
+                catch { }
+            });
+        }
+
+        void DoInstall()
+        {
+            go.Enabled = close.Enabled = false;
+            bar.Visible = true;
+            msg.Text = "Downloading KonaSnap " + info.Ver + "...";
+            var i = info;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Exception err = null;
+                try { Updater.Install(i, delegate(int p) { try { BeginInvoke((MethodInvoker)delegate { bar.Value = Math.Max(0, Math.Min(100, p)); }); } catch { } }); }
+                catch (Exception ex) { err = ex; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (err != null)
+                        {
+                            bar.Visible = false;
+                            msg.Text = "The update didn't install. KonaSnap is unchanged.\n\n" + err.Message;
+                            go.Enabled = close.Enabled = true;
+                            return;
+                        }
+                        msg.Text = "Installed. Restarting KonaSnap...";
+                        Updater.Restart();
+                    });
+                }
+                catch { }
+            });
         }
     }
 
@@ -1021,6 +1295,8 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         NiceButton regionBtn, textBtn, scrollBtn;
         public float S = 1f; // DPI scale
         public string StartupCommand;
+        public bool JustUpdated;
+        LinkLabel updateLink;
         readonly uint WM_TASKBARBUTTONCREATED = Native.RegisterWindowMessage("TaskbarButtonCreated");
 
         public MainForm()
@@ -1062,6 +1338,17 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             tip.Text = "In the picker, the mouse wheel steps between a whole window and the panels inside it. Every capture is copied to the clipboard and saved in Pictures\\KonaSnap.";
             flow.Controls.Add(tip);
 
+            updateLink = new LinkLabel();
+            updateLink.AutoSize = true;
+            updateLink.Font = new Font("Segoe UI", 9f);
+            updateLink.LinkColor = Theme.Ocean;
+            updateLink.ActiveLinkColor = Theme.Lagoon;
+            updateLink.Margin = new Padding((int)(4 * S), (int)(2 * S), 3, 3);
+            updateLink.Text = "KonaSnap " + Updater.Version + "  \u00b7  Check for updates";
+            updateLink.LinkArea = new LinkArea(updateLink.Text.Length - "Check for updates".Length, "Check for updates".Length);
+            updateLink.LinkClicked += delegate { ShowUpdates(pendingUpdate); };
+            flow.Controls.Add(updateLink);
+
             var header = new HeaderBand(S);
             Controls.Add(header);
             Controls.Add(flow);
@@ -1099,12 +1386,45 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         {
             base.OnShown(e);
             Taskbar.BuildJumpList();
+            if (JustUpdated) updateLink.Text = "Updated to KonaSnap " + Updater.Version + "  \u00b7  Check for updates";
+            if (JustUpdated) updateLink.LinkArea = new LinkArea(updateLink.Text.Length - "Check for updates".Length, "Check for updates".Length);
+            CheckForUpdateQuietly();
             if (StartupCommand != null)
             {
                 string c = StartupCommand;
                 StartupCommand = null;
                 BeginInvoke((MethodInvoker)delegate { RunCommand(c); });
             }
+        }
+
+        Updater.Info pendingUpdate;
+
+        // Looks for a new version in the background; if there is one, the link at the bottom says so.
+        void CheckForUpdateQuietly()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Updater.Info r = null;
+                try { r = Updater.Check(); } catch { }
+                if (r == null) return;
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        pendingUpdate = r;
+                        string t = "Update ready: KonaSnap " + r.Ver;
+                        updateLink.Text = t;
+                        updateLink.LinkArea = new LinkArea(0, t.Length);
+                        updateLink.LinkColor = Theme.Sunset;
+                    });
+                }
+                catch { }
+            });
+        }
+
+        void ShowUpdates(Updater.Info found)
+        {
+            using (var f = new UpdateForm(found)) f.ShowDialog(this);
         }
 
         public void RunCommand(string cmd)

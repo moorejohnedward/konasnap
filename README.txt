@@ -1,4 +1,12 @@
-KonaSnap v2 - screen capture, scrolling capture, markup and text grab
+KonaSnap v2.1 - screen capture, scrolling capture, markup and text grab
+
+UPDATES (v2.1 and later)
+- KonaSnap updates itself. The line at the bottom of the main window says
+  "Check for updates" and turns orange when a new version is ready. Click it,
+  then "Update now". No need to run build.bat again.
+- Source code and every version: https://github.com/moorejohnedward/konasnap
+- If KonaSnap ever hits an error, the details are copied to your clipboard and
+  saved in %LOCALAPPDATA%\KonaSnap\crash.log. Paste them to Claude.
 
 SET UP (once, and again after each update)
 1. Double-click build.bat. It closes any running KonaSnap, builds the new KonaSnap.exe

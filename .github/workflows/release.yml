@@ -1,0 +1,80 @@
+# Release: whenever main gets a new version number (Updater.Version in KonaSnap.cs),
+# GitHub builds KonaSnap.exe and posts it as a Release (tag vX.Y.Z) with its
+# SHA-256 fingerprint. KonaSnap's "Check for updates" link installs from the newest
+# Release. Pushes that don't change the version are skipped.
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and see if it's already released
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path KonaSnap.cs -Pattern 'public const string Version = "([0-9.]+)"' | Select-Object -First 1
+          if (-not $m) { throw "Version constant not found in KonaSnap.cs" }
+          $ver = $m.Matches[0].Groups[1].Value
+          $asm = Select-String -Path KonaSnap.cs -Pattern 'AssemblyVersion\("([0-9.]+)"\)' | Select-Object -First 1
+          if ($asm -and -not $asm.Matches[0].Groups[1].Value.StartsWith($ver)) { throw "AssemblyVersion doesn't match Updater.Version $ver" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          gh release view "v$ver" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "v$ver is already released - nothing to do."
+            "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Releasing v$ver"
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
+
+      - name: Build
+        if: steps.ver.outputs.skip == 'false'
+        shell: cmd
+        run: call build.bat
+
+      - name: Fingerprint (SHA-256) for the updater's safety check
+        if: steps.ver.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash KonaSnap.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  KonaSnap.exe" | Out-File -Encoding ascii KonaSnap.exe.sha256
+
+      - name: Release notes from CHANGELOG.md
+        if: steps.ver.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^##\s+\[?v?$([regex]::Escape($ver))\b" | Select-Object -First 1).LineNumber
+          if ($start) {
+            $rest = $lines[$start..($lines.Count - 1)]
+            $end = ($rest | Select-String -Pattern '^##\s' | Select-Object -First 1).LineNumber
+            $notes = if ($end -gt 1) { $rest[0..($end - 2)] } elseif ($end -eq 1) { @("Version $ver") } else { $rest }
+          } else { $notes = @("Version $ver") }
+          $notes -join "`n" | Out-File -Encoding utf8 notes.md
+
+      - name: Create GitHub Release
+        if: steps.ver.outputs.skip == 'false'
+        run: >
+          gh release create "v${{ steps.ver.outputs.version }}"
+          KonaSnap.exe KonaSnap.exe.sha256
+          --target "${{ github.sha }}"
+          --title "KonaSnap ${{ steps.ver.outputs.version }}"
+          --notes-file notes.md

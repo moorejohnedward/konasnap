@@ -1,0 +1,23 @@
+# Build check: compiles KonaSnap on GitHub's Windows servers on every push,
+# with the same build.bat John uses, so errors show up here and not on his PC.
+name: Build check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with build.bat (.NET Framework 4 C# compiler)
+        shell: cmd
+        run: call build.bat
+      - name: Check the exe exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path KonaSnap.exe)) { throw "KonaSnap.exe was not built" }
+          (Get-Item KonaSnap.exe).VersionInfo | Format-List FileVersion, ProductName
