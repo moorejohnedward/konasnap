@@ -1,5 +1,8 @@
 # Changelog - KonaSnap
 
+## v2.1.1 - Nov 11, 2026 (Crash on open fixed)
+- **Fixed: KonaSnap crashed with an "unhandled exception" every time it opened.** While setting itself up, KonaSnap asked for the screen's size settings in a way that made Windows build the window too early. Windows then tried to put the shortcut keys on buttons that didn't exist yet. It now reads those settings without building the window early, and only labels the buttons once they exist. (Found with the new crash report.)
+
 ## v2.1.0 - Nov 11, 2026 (Faster captures, in-app updates, crash reports)
 - **Snappier captures:**
   - The hotkeys, taskbar menu and hover buttons start the picker right away. Before, every capture waited a fixed 0.3 seconds.

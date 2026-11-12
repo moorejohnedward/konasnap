@@ -20,8 +20,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("KonaSnap")]
 [assembly: System.Reflection.AssemblyProduct("KonaSnap")]
 [assembly: System.Reflection.AssemblyCompany("John Moore")]
-[assembly: System.Reflection.AssemblyVersion("2.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.1.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.1.1.0")]
 
 namespace KonaSnap
 {
@@ -73,7 +73,7 @@ namespace KonaSnap
     // against the hash before the running copy is swapped out.
     static class Updater
     {
-        public const string Version = "2.1.0";
+        public const string Version = "2.1.1";
         const string Owner = "moorejohnedward", Repo = "konasnap", AssetName = "KonaSnap.exe";
 
         public class Info { public string Tag, ExeUrl, ShaUrl, Notes, PageUrl; public System.Version Ver; public long Size; }
@@ -1302,7 +1302,9 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
         public MainForm()
         {
             Instance = this;
-            using (var g = CreateGraphics()) S = g.DpiX / 96f;
+            // Read the screen's DPI without creating this window's handle yet. (CreateGraphics() here made
+            // Windows create the window early, before the buttons existed, which crashed KonaSnap on open.)
+            using (var g = Graphics.FromHwnd(IntPtr.Zero)) S = g.DpiX / 96f;
             Text = AppTitle;
             Font = new Font("Segoe UI", 10f);
             FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -1356,6 +1358,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             header.Bounds = new Rectangle(0, 0, pref.Width, (int)(74 * S));
             flow.Location = new Point(0, header.Height);
             ClientSize = new Size(pref.Width, header.Height + pref.Height);
+            ShowHotkeyLabels();
         }
 
         NiceButton Btn(string title, string sub, string icon, bool primary, EventHandler click)
@@ -1371,15 +1374,26 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             return b;
         }
 
+        string regionKey, textKey, scrollKey;
+
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             var keys = new List<string>();
             if (Native.RegisterHotKey(Handle, HK_PRTSC, 0x4000, 0x2C)) keys.Add("PrtScn");
             if (Native.RegisterHotKey(Handle, HK_CTRLSHIFTX, 0x0002 | 0x0004 | 0x4000, (uint)Keys.X)) keys.Add("Ctrl+Shift+X");
-            if (keys.Count > 0) regionBtn.Key = keys[0];
-            if (Native.RegisterHotKey(Handle, HK_TEXT, 0x0002 | 0x0001 | 0x4000, (uint)Keys.T)) textBtn.Key = "Ctrl+Alt+T";
-            if (Native.RegisterHotKey(Handle, HK_SCROLL, 0x0002 | 0x0001 | 0x4000, (uint)Keys.S)) scrollBtn.Key = "Ctrl+Alt+S";
+            regionKey = keys.Count > 0 ? keys[0] : null;
+            textKey = Native.RegisterHotKey(Handle, HK_TEXT, 0x0002 | 0x0001 | 0x4000, (uint)Keys.T) ? "Ctrl+Alt+T" : null;
+            scrollKey = Native.RegisterHotKey(Handle, HK_SCROLL, 0x0002 | 0x0001 | 0x4000, (uint)Keys.S) ? "Ctrl+Alt+S" : null;
+            ShowHotkeyLabels();
+        }
+
+        // Puts the shortcut keys on the buttons (safe to call before the buttons exist).
+        void ShowHotkeyLabels()
+        {
+            if (regionBtn != null && regionKey != null) { regionBtn.Key = regionKey; regionBtn.Invalidate(); }
+            if (textBtn != null && textKey != null) { textBtn.Key = textKey; textBtn.Invalidate(); }
+            if (scrollBtn != null && scrollKey != null) { scrollBtn.Key = scrollKey; scrollBtn.Invalidate(); }
         }
 
         protected override void OnShown(EventArgs e)

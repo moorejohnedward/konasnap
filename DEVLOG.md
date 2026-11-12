@@ -55,3 +55,15 @@ Each entry records what was built, why, and the concepts behind it. The Git comm
 **Result:** After this one install, new versions arrive with one click from inside KonaSnap, and any crash leaves a report that pinpoints the line that failed.
 
 ---
+
+## 2026-11-11: v2.1.1, The startup crash, found and fixed
+
+**Problem:** KonaSnap crashed on every launch. The new crash reporter caught it on the first try: `NullReferenceException in MainForm.OnHandleCreated`.
+
+**Cause:** the constructor called `CreateGraphics()` to read the screen DPI. That forces Windows to create the window handle immediately, which fires `OnHandleCreated` before the constructor has created the buttons, so setting `regionBtn.Key` hit a null reference.
+
+**Fix:** read the DPI from the desktop (`Graphics.FromHwnd(IntPtr.Zero)`) so the handle isn't created early, store the hotkey labels, and apply them only once the buttons exist.
+
+**Lesson:** in Windows Forms, anything that touches `Handle` (including `CreateGraphics`) inside a constructor can run window-creation code before the object is fully built. This is the value of crash logging: hours of guessing became a one-line stack trace.
+
+---
