@@ -67,3 +67,16 @@ Each entry records what was built, why, and the concepts behind it. The Git comm
 **Lesson:** in Windows Forms, anything that touches `Handle` (including `CreateGraphics`) inside a constructor can run window-creation code before the object is fully built. This is the value of crash logging: hours of guessing became a one-line stack trace.
 
 ---
+
+## 2026-11-13: v2.1.2, Scrolling capture stopped itself
+
+**Problem:** Scrolling capture never scrolled. It always came back as a normal screenshot.
+
+**Diagnosis:** `Pictures\KonaSnap\scroll-log.txt` showed: "Cursor set to {X=5981,Y=1433}, reads back as {X=5963,Y=1402}", then "Mouse moved to {X=5946,Y=1377}; stopping." Between those two readings KonaSnap didn't move the pointer, but it kept drifting up and to the left. That was my hand settling after the click. The "did the user move the mouse?" check allowed only 40 pixels, which is tiny on a 4K screen.
+
+**Fix:** a 1.5-second grace period where drift is undone instead of treated as "stop", a tolerance sized to the screen (height / 12, about 180 px at 4K), and Esc as a clear way to stop (`GetAsyncKeyState`).
+
+**Concepts:** reading your own diagnostic logs, input tolerance that scales with screen resolution, polling key state with the Windows API.
+
+**Lesson:** a log line that records both what the program did and what it observed ("set to X, reads back as Y") made the cause visible without a debugger.
+

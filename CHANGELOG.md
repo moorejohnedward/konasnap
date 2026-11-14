@@ -1,5 +1,11 @@
 # Changelog - KonaSnap
 
+## v2.1.2 - Nov 13, 2026 (Scrolling capture actually scrolls)
+- **Fixed: scrolling capture stopped half a second after it started** and just gave a normal screenshot. It stops when you move the mouse, but it was counting the little drift of your hand right after clicking the panel (about 30-60 pixels on a 4K screen) as "moving the mouse."
+  - For the first 1.5 seconds, small drift is ignored and the pointer is put back.
+  - After that it only stops if the mouse is moved well away (about 180 pixels on a 4K screen, scaled to your screen size).
+- **New: press Esc to stop a scrolling capture** at any time. The "working on it" pill now says so.
+
 ## v2.1.1 - Nov 11, 2026 (Crash on open fixed)
 - **Fixed: KonaSnap crashed with an "unhandled exception" every time it opened.** While setting itself up, KonaSnap asked for the screen's size settings in a way that made Windows build the window too early. Windows then tried to put the shortcut keys on buttons that didn't exist yet. It now reads those settings without building the window early, and only labels the buttons once they exist. (Found with the new crash report.)
 

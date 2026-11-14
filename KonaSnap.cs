@@ -20,8 +20,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("KonaSnap")]
 [assembly: System.Reflection.AssemblyProduct("KonaSnap")]
 [assembly: System.Reflection.AssemblyCompany("John Moore")]
-[assembly: System.Reflection.AssemblyVersion("2.1.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.1.1.0")]
+[assembly: System.Reflection.AssemblyVersion("2.1.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.1.2.0")]
 
 namespace KonaSnap
 {
@@ -73,7 +73,7 @@ namespace KonaSnap
     // against the hash before the running copy is swapped out.
     static class Updater
     {
-        public const string Version = "2.1.1";
+        public const string Version = "2.1.2";
         const string Owner = "moorejohnedward", Repo = "konasnap", AssetName = "KonaSnap.exe";
 
         public class Info { public string Tag, ExeUrl, ShaUrl, Notes, PageUrl; public System.Version Ver; public long Size; }
@@ -346,6 +346,7 @@ namespace KonaSnap
         [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
         [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
         [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
         [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public MOUSEINPUT mi; }
         [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
@@ -2586,10 +2587,28 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             return second - bestMean >= 1.5 ? best : -1;    // so-so fit: only if it's clearly the best one
         }
 
+        // Stop when Esc is pressed, or when the mouse is clearly moved away on purpose.
+        // For the first moments after the click the hand is still settling, so small drift is just undone.
+        static DateTime graceUntil;
+        static int moveTolerance = 40;
+        static bool escPressed;
+
         static bool Moved(Point where)
         {
+            if ((Native.GetAsyncKeyState(0x1B) & 0x8000) != 0) { escPressed = true; return true; }
             var p = Native.CursorPos();
-            return Math.Abs(p.X - where.X) > 40 || Math.Abs(p.Y - where.Y) > 40;
+            bool far = Math.Abs(p.X - where.X) > moveTolerance || Math.Abs(p.Y - where.Y) > moveTolerance;
+            if (far && DateTime.UtcNow < graceUntil)
+            {
+                Native.SetCursorPos(where.X, where.Y);
+                return false;
+            }
+            return far;
+        }
+
+        static string StopNote()
+        {
+            return escPressed ? "Stopped because you pressed Esc." : "Stopped because the mouse moved.";
         }
 
         static void SaveDebug(Bitmap a, Bitmap b)
@@ -2635,6 +2654,10 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             Log("KonaSnap scrolling capture. Area " + r + "  fromTop=" + fromTop + "  screens:");
             foreach (var s in Screen.AllScreens) Log("   " + s.DeviceName + " " + s.Bounds + (s.Primary ? " primary" : ""));
             var home = Native.CursorPos();
+            escPressed = false;
+            graceUntil = DateTime.UtcNow.AddSeconds(1.5);
+            Screen scr = Screen.FromRectangle(r);
+            moveTolerance = Math.Max(60, scr.Bounds.Height / 12); // about 180 px on a 4K screen
 
             // Where to turn the wheel: the middle first, then other spots (the middle might be over an image
             // or a small text box that scrolls on its own).
@@ -2678,13 +2701,13 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             {
                 for (int step = 0; step < 400; step++)
                 {
-                    if (Moved(center)) { userMoved = true; note = "Stopped because the mouse moved."; Log("Mouse moved to " + Native.CursorPos() + "; stopping."); break; }
+                    if (Moved(center)) { userMoved = true; note = StopNote(); Log((escPressed ? "Esc pressed" : "Mouse moved to " + Native.CursorPos()) + "; stopping."); break; }
                     Native.SetCursorPos(center.X, center.Y);
                     Native.Wheel(-notches);
                     Rows cr;
                     bool changed;
                     Bitmap cur = AfterScroll(r, x1, pr, out cr, out changed);
-                    if (Moved(center)) { cur.Dispose(); userMoved = true; note = "Stopped because the mouse moved."; Log("Mouse moved; stopping."); break; }
+                    if (Moved(center)) { cur.Dispose(); userMoved = true; note = StopNote(); Log((escPressed ? "Esc pressed" : "Mouse moved") + "; stopping."); break; }
 
                     if (!changed)
                     {
@@ -2782,7 +2805,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
                     if (prev != first) prev.Dispose();
                     prev = cur;
                     pr = cr;
-                    if (progress != null) progress("Captured " + (firstKeep + total) + " px so far...");
+                    if (progress != null) progress("Captured " + (firstKeep + total) + " px so far...  Esc stops");
                     if (firstKeep + total >= MaxHeight) { note = "Stopped at the maximum length."; break; }
                 }
             }
@@ -2824,7 +2847,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
     {
         readonly Rectangle avoid;
         readonly float S;
-        string text = "Scrolling capture...";
+        string text = "Scrolling capture...  Esc stops";
         readonly Font font = new Font("Segoe UI Semibold", 10f);
 
         public ScrollIndicator(Rectangle avoid, float scale)
