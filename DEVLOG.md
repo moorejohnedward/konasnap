@@ -80,3 +80,15 @@ Each entry records what was built, why, and the concepts behind it. The Git comm
 
 **Lesson:** a log line that records both what the program did and what it observed ("set to X, reads back as Y") made the cause visible without a debugger.
 
+## 2026-11-13: v2.1.3, The updater never saw an update
+
+**Problem:** after v2.1.2 was published, Check for updates still said 2.1.1 was the newest.
+
+**Cause:** `Updater.Check` found each download with one regular expression: `"name" ... "size" ... "browser_download_url"`, using `[^{}]*?` so it wouldn't run into the next asset. But in GitHub's JSON each asset has an `"uploader": { ... }` object between `name` and `size`. The braces stopped the match every time, so no download was ever found and Check returned "up to date". The updater could never have worked, which is why this version has to be installed by hand once.
+
+**Fix:** take each asset's file name from the end of its `browser_download_url`, and its size from the last `"size"` before that link. Tested against the real v2.1.2 release JSON: it now finds KonaSnap.exe (153,088 bytes) and its .sha256.
+
+**Concepts:** why regular expressions are fragile for parsing nested JSON, testing a parser against real data instead of an assumed shape.
+
+**Lesson:** test the update path end to end (publish a version, then update to it) before relying on it.
+

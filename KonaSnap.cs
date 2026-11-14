@@ -20,8 +20,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("KonaSnap")]
 [assembly: System.Reflection.AssemblyProduct("KonaSnap")]
 [assembly: System.Reflection.AssemblyCompany("John Moore")]
-[assembly: System.Reflection.AssemblyVersion("2.1.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.1.2.0")]
+[assembly: System.Reflection.AssemblyVersion("2.1.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.1.3.0")]
 
 namespace KonaSnap
 {
@@ -73,7 +73,7 @@ namespace KonaSnap
     // against the hash before the running copy is swapped out.
     static class Updater
     {
-        public const string Version = "2.1.2";
+        public const string Version = "2.1.3";
         const string Owner = "moorejohnedward", Repo = "konasnap", AssetName = "KonaSnap.exe";
 
         public class Info { public string Tag, ExeUrl, ShaUrl, Notes, PageUrl; public System.Version Ver; public long Size; }
@@ -121,13 +121,21 @@ namespace KonaSnap
             System.Version v;
             if (!System.Version.TryParse(info.Tag.TrimStart('v', 'V'), out v)) return null;
             info.Ver = v;
-            // each asset block: "name": "...", ... "size": n, ... "browser_download_url": "..."
+            // Each asset ends with "browser_download_url": ".../<file name>". The file name is taken from that link,
+            // and the size from the last "size" before it (an asset's "uploader" block sits between its name and
+            // size, so don't try to match name ... size in one pattern).
             foreach (System.Text.RegularExpressions.Match a in System.Text.RegularExpressions.Regex.Matches(json,
-                "\"name\"\\s*:\\s*\"([^\"]+)\"[^{}]*?\"size\"\\s*:\\s*(\\d+)[^{}]*?\"browser_download_url\"\\s*:\\s*\"([^\"]+)\""))
+                "\"browser_download_url\"\\s*:\\s*\"([^\"]+)\""))
             {
-                string name = a.Groups[1].Value;
-                if (name.Equals(AssetName, StringComparison.OrdinalIgnoreCase)) { info.ExeUrl = a.Groups[3].Value; info.Size = long.Parse(a.Groups[2].Value); }
-                else if (name.Equals(AssetName + ".sha256", StringComparison.OrdinalIgnoreCase)) info.ShaUrl = a.Groups[3].Value;
+                string url = a.Groups[1].Value;
+                string name = Uri.UnescapeDataString(url.Substring(url.LastIndexOf('/') + 1));
+                if (name.Equals(AssetName, StringComparison.OrdinalIgnoreCase))
+                {
+                    info.ExeUrl = url;
+                    var sizes = System.Text.RegularExpressions.Regex.Matches(json.Substring(0, a.Index), "\"size\"\\s*:\\s*(\\d+)");
+                    if (sizes.Count > 0) info.Size = long.Parse(sizes[sizes.Count - 1].Groups[1].Value);
+                }
+                else if (name.Equals(AssetName + ".sha256", StringComparison.OrdinalIgnoreCase)) info.ShaUrl = url;
             }
             if (info.ExeUrl == null || info.ShaUrl == null) return null;
             return v > Current ? info : null;

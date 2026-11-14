@@ -1,5 +1,9 @@
 # Changelog - KonaSnap
 
+## v2.1.3 - Nov 13, 2026 (Check for updates actually finds updates)
+- **Fixed: "Check for updates" always said KonaSnap was up to date**, even when a newer version was on GitHub. It couldn't read the download link out of GitHub's answer, so it never saw any new version. It now finds the download, its size and its safety fingerprint correctly.
+- This one has to be installed by hand once (run build.bat, or download KonaSnap.exe from the GitHub release). After that, updates come through Check for updates.
+
 ## v2.1.2 - Nov 13, 2026 (Scrolling capture actually scrolls)
 - **Fixed: scrolling capture stopped half a second after it started** and just gave a normal screenshot. It stops when you move the mouse, but it was counting the little drift of your hand right after clicking the panel (about 30-60 pixels on a 4K screen) as "moving the mouse."
   - For the first 1.5 seconds, small drift is ignored and the pointer is put back.
