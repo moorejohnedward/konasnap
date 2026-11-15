@@ -1,0 +1,13 @@
+# Dependabot: checks weekly for newer versions of the tools and libraries this repo uses
+# and opens one pull request with the updates. Security fixes come as soon as they exist.
+# Merge it once the Build check on that pull request passes.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      github_actions:
+        patterns: ["*"]
