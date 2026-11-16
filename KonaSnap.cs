@@ -1,6 +1,7 @@
 ﻿// KonaSnap - a simple Snagit-style screen capture and markup tool for Windows.
 // v2: scrolling capture, panels inside windows, full-text grab, new tools and a fresh look.
 // v2.1: in-app updates from GitHub Releases and a crash report that is saved and copied to the clipboard.
+// v2.2: much better text reading (real paragraphs, dark mode, small text) and links to PDF and Moore.
 // Build with build.bat (uses the C# compiler that ships with Windows / .NET Framework 4).
 // C# 5 syntax only, so it compiles with the built-in csc.exe.
 
@@ -20,8 +21,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("KonaSnap")]
 [assembly: System.Reflection.AssemblyProduct("KonaSnap")]
 [assembly: System.Reflection.AssemblyCompany("John Moore")]
-[assembly: System.Reflection.AssemblyVersion("2.1.3.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.1.3.0")]
+[assembly: System.Reflection.AssemblyVersion("2.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.2.0.0")]
 
 namespace KonaSnap
 {
@@ -55,6 +56,7 @@ namespace KonaSnap
                     }
                     return;
                 }
+                PdfLink.RegisterSelf();
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 MainForm main;
@@ -73,7 +75,7 @@ namespace KonaSnap
     // against the hash before the running copy is swapped out.
     static class Updater
     {
-        public const string Version = "2.1.3";
+        public const string Version = "2.2.0";
         const string Owner = "moorejohnedward", Repo = "konasnap", AssetName = "KonaSnap.exe";
 
         public class Info { public string Tag, ExeUrl, ShaUrl, Notes, PageUrl; public System.Version Ver; public long Size; }
@@ -805,6 +807,16 @@ namespace KonaSnap
                         using (var r = Theme.Round(new RectangleF(5, 3, 14, 18), 2f)) g.DrawPath(p, r);
                         g.DrawLine(p, 8.5f, 8, 15.5f, 8); g.DrawLine(p, 8.5f, 12, 15.5f, 12); g.DrawLine(p, 8.5f, 16, 13, 16);
                         break;
+                    case "pdfmoore":
+                        using (var r = Theme.Round(new RectangleF(4.5f, 2.5f, 15, 19), 2f)) g.DrawPath(p, r);
+                        using (var f = new Font("Segoe UI", 6.6f, FontStyle.Bold, GraphicsUnit.Pixel))
+                        using (var sf = new StringFormat())
+                        {
+                            sf.Alignment = StringAlignment.Center; sf.LineAlignment = StringAlignment.Center;
+                            g.DrawString("PDF", f, br, new RectangleF(3, 6, 18, 8), sf);
+                        }
+                        g.DrawLine(p, 8, 16.5f, 16, 16.5f);
+                        break;
                     case "save":
                     case "saveas":
                         using (var r = Theme.Round(new RectangleF(4, 4, 16, 16), 2.5f)) g.DrawPath(p, r);
@@ -1029,10 +1041,27 @@ namespace KonaSnap
     }
 
     // ------------------------------------------------------------------ text recognition (Windows built-in OCR)
+    // v2.2: Windows reports where every word is, so lines are rebuilt into real paragraphs (no hard line break
+    // at the end of every screen line), light-on-dark text is flipped before reading, small text is enlarged by
+    // just the right amount, and all the slices of a long capture are read in one go.
+    class OcrText
+    {
+        public string Joined = ""; // lines joined back into paragraphs, the way the text was written
+        public string Lines = "";  // one line per line on the screen
+    }
+
+    class OcrLine
+    {
+        public float X, Y, R, B;   // box in the original picture's pixels
+        public float FirstWordW;   // width of its first word ("would it have fit on the line above?")
+        public string Text = "";
+    }
+
     static class Ocr
     {
         // Runs Windows.Media.Ocr through Windows PowerShell, so no extra SDK or download is needed.
-        const string Script = @"param([string]$Path)
+        // Reads every picture listed in the file it's given, and prints each word with its box.
+        const string Script = @"param([string]$List)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -1041,45 +1070,310 @@ $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsR
 $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
 function Await($op, $type) { $t = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op)); $null = $t.Wait(-1); $t.Result }
-$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
-$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-$max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
-if ($decoder.PixelWidth -gt $max -or $decoder.PixelHeight -gt $max) {
-  $s = [Math]::Min($max / $decoder.PixelWidth, $max / $decoder.PixelHeight)
-  $tr = [Windows.Graphics.Imaging.BitmapTransform]::new()
-  $tr.ScaledWidth = [uint32][Math]::Floor($decoder.PixelWidth * $s)
-  $tr.ScaledHeight = [uint32][Math]::Floor($decoder.PixelHeight * $s)
-  $tr.InterpolationMode = [Windows.Graphics.Imaging.BitmapInterpolationMode]::Fant
-  $bitmap = Await ($decoder.GetSoftwareBitmapAsync([Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8, [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied, $tr, [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation, [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage)) ([Windows.Graphics.Imaging.SoftwareBitmap])
-} else {
-  $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-}
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 if ($engine -eq $null) { [Console]::Error.WriteLine('NO_OCR_LANGUAGE'); exit 2 }
-$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-$stream.Dispose()
-foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
+$tab = [char]9
+$max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+$paths = Get-Content -LiteralPath $List -Encoding UTF8
+$i = -1
+foreach ($Path in $paths) {
+  $i++
+  if (-not $Path) { continue }
+  try {
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $s = 1.0
+    if ($decoder.PixelWidth -gt $max -or $decoder.PixelHeight -gt $max) {
+      $s = [Math]::Min($max / $decoder.PixelWidth, $max / $decoder.PixelHeight)
+      $tr = [Windows.Graphics.Imaging.BitmapTransform]::new()
+      $tr.ScaledWidth = [uint32][Math]::Floor($decoder.PixelWidth * $s)
+      $tr.ScaledHeight = [uint32][Math]::Floor($decoder.PixelHeight * $s)
+      $tr.InterpolationMode = [Windows.Graphics.Imaging.BitmapInterpolationMode]::Fant
+      $bitmap = Await ($decoder.GetSoftwareBitmapAsync([Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8, [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied, $tr, [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation, [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage)) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    } else {
+      $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    }
+    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    $stream.Dispose()
+    [Console]::Out.WriteLine('@IMG' + $tab + $i + $tab + $s.ToString([System.Globalization.CultureInfo]::InvariantCulture))
+    foreach ($line in $result.Lines) {
+      [Console]::Out.WriteLine('@L')
+      foreach ($w in $line.Words) {
+        $r = $w.BoundingRect
+        [Console]::Out.WriteLine('W' + $tab + [int]$r.X + $tab + [int]$r.Y + $tab + [int]$r.Width + $tab + [int]$r.Height + $tab + $w.Text)
+      }
+    }
+  } catch {
+    [Console]::Out.WriteLine('@ERR' + $tab + $i + $tab + $_.Exception.Message)
+  }
+}
 ";
 
-        // Long images (like scrolling captures) are read in slices, cut on blank rows so no line of text is split.
+        // Simple form for older callers: the text as paragraphs.
         public static string Run(Bitmap src, out string error)
         {
+            return Read(src, out error).Joined;
+        }
+
+        // Long images (like scrolling captures) are cut into slices on blank rows so no line of text is split,
+        // and every slice is read by one PowerShell run.
+        public static OcrText Read(Bitmap src, out string error)
+        {
             error = null;
-            if (src.Height <= 2400) return RunOne(src, out error);
-            var cuts = SliceRows(src, 1600);
-            var sb = new StringBuilder();
-            for (int i = 0; i + 1 < cuts.Count; i++)
+            var result = new OcrText();
+            List<int> cuts;
+            if (src.Height <= 2400) { cuts = new List<int>(); cuts.Add(0); cuts.Add(src.Height); }
+            else cuts = SliceRows(src, 1600);
+
+            string dir = Path.Combine(Path.GetTempPath(), "KonaSnap");
+            Directory.CreateDirectory(dir);
+            string script = Path.Combine(dir, "ocr2.ps1");
+            string id = Guid.NewGuid().ToString("N");
+            string listPath = Path.Combine(dir, "ocr-" + id + ".txt");
+            var files = new List<string>();
+            var scales = new List<float>();
+            var tops = new List<int>();
+            try
             {
-                var rect = new Rectangle(0, cuts[i], src.Width, cuts[i + 1] - cuts[i]);
-                if (rect.Height < 2) continue;
-                string e, part;
-                using (var piece = src.Clone(rect, PixelFormat.Format32bppArgb)) part = RunOne(piece, out e);
-                if (e != null && error == null) error = e;
-                if (part.Length > 0) { if (sb.Length > 0) sb.Append('\n'); sb.Append(part); }
-                if (e != null && e.StartsWith("Windows has no text")) break;
+                File.WriteAllText(script, Script, new UTF8Encoding(true));
+                bool dark = IsDark(src);
+                for (int i = 0; i + 1 < cuts.Count; i++)
+                {
+                    var rect = new Rectangle(0, cuts[i], src.Width, cuts[i + 1] - cuts[i]);
+                    if (rect.Height < 2) continue;
+                    string imgPath = Path.Combine(dir, "ocr-" + id + "-" + i + ".png");
+                    float k;
+                    using (var piece = src.Clone(rect, PixelFormat.Format32bppArgb))
+                    using (var prepared = Prepare(piece, dark, out k))
+                        prepared.Save(imgPath, ImageFormat.Png);
+                    files.Add(imgPath);
+                    scales.Add(k);
+                    tops.Add(cuts[i]);
+                }
+                File.WriteAllLines(listPath, files.ToArray(), new UTF8Encoding(false));
+
+                string output, err;
+                int code = PowerShell(script, listPath, 30000 + 20000 * files.Count, out output, out err);
+                if (code == -1) { error = "Reading the text took too long."; return result; }
+                if (err.Contains("NO_OCR_LANGUAGE"))
+                {
+                    error = "Windows has no text-recognition language installed. Add one in Settings > Time & language > Language & region.";
+                    return result;
+                }
+
+                var lines = Parse(output, scales, tops, ref error);
+
+                if (lines.Count == 0 && error == null && code != 0)
+                    error = "Windows couldn't read text from this image." + (err.Trim().Length > 0 ? " (" + FirstLine(err) + ")" : "");
+                result.Joined = Layout.Paragraphs(lines);
+                result.Lines = Layout.AsLines(lines);
+                return result;
             }
-            return sb.ToString();
+            catch (Exception ex)
+            {
+                error = "Text reading failed: " + ex.Message;
+                return result;
+            }
+            finally
+            {
+                foreach (string fpath in files) try { File.Delete(fpath); } catch { }
+                try { File.Delete(listPath); } catch { }
+            }
+        }
+
+        // Turns the reader's output (@IMG / @L / W lines) into lines, in the original picture's pixels.
+        public static List<OcrLine> Parse(string output, List<float> scales, List<int> tops, ref string error)
+        {
+            var lines = new List<OcrLine>();
+            OcrLine cur = null;
+            var words = new List<float[]>();
+            var texts = new List<string>();
+            int img = -1;
+            float f = 1f;
+            int top = 0;
+            foreach (string raw in output.Replace("\r", "").Split('\n'))
+            {
+                if (raw.Length == 0) continue;
+                string[] p = raw.Split('\t');
+                if (p[0] == "@IMG" && p.Length >= 3)
+                {
+                    Finish(cur, words, texts, lines); cur = null;
+                    int.TryParse(p[1], out img);
+                    float s;
+                    if (!float.TryParse(p[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out s) || s <= 0) s = 1f;
+                    bool ok = img >= 0 && img < scales.Count;
+                    f = ok ? 1f / (scales[img] * s) : 1f;
+                    top = ok ? tops[img] : 0;
+                }
+                else if (p[0] == "@L")
+                {
+                    Finish(cur, words, texts, lines);
+                    cur = new OcrLine();
+                }
+                else if (p[0] == "W" && p.Length >= 6 && cur != null)
+                {
+                    float x, y, w, h;
+                    float.TryParse(p[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out x);
+                    float.TryParse(p[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out y);
+                    float.TryParse(p[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out w);
+                    float.TryParse(p[4], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out h);
+                    // The word itself may contain anything except a tab.
+                    string word = string.Join("\t", p, 5, p.Length - 5);
+                    words.Add(new float[] { x * f, y * f + top, (x + w) * f, (y + h) * f + top });
+                    texts.Add(word);
+                }
+                else if (p[0] == "@ERR" && error == null)
+                {
+                    error = "Windows couldn't read part of the picture" + (p.Length > 2 ? " (" + p[2] + ")" : "") + ".";
+                }
+            }
+Finish(cur, words, texts, lines);
+            return lines;
+        }
+
+        // Turns the words collected for one line into an OcrLine (words in reading order; wide gaps become a tab).
+        static void Finish(OcrLine line, List<float[]> words, List<string> texts, List<OcrLine> into)
+        {
+            if (line != null && words.Count > 0)
+            {
+                line.X = words[0][0]; line.Y = words[0][1]; line.R = words[0][2]; line.B = words[0][3];
+                for (int i = 1; i < words.Count; i++)
+                {
+                    line.X = Math.Min(line.X, words[i][0]); line.Y = Math.Min(line.Y, words[i][1]);
+                    line.R = Math.Max(line.R, words[i][2]); line.B = Math.Max(line.B, words[i][3]);
+                }
+                float lh = Math.Max(1f, line.B - line.Y);
+                line.FirstWordW = words[0][2] - words[0][0];
+                var sb = new StringBuilder(texts[0]);
+                for (int i = 1; i < words.Count; i++)
+                {
+                    float gap = words[i][0] - words[i - 1][2];
+                    sb.Append(gap > 3.2f * lh ? "\t" : " ");
+                    sb.Append(texts[i]);
+                }
+                line.Text = sb.ToString();
+                into.Add(line);
+            }
+            words.Clear();
+            texts.Clear();
+        }
+
+        static int PowerShell(string script, string arg, int timeoutMs, out string output, out string error)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("powershell.exe",
+                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script + "\" \"" + arg + "\"");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            psi.StandardErrorEncoding = Encoding.UTF8;
+            using (var p = System.Diagnostics.Process.Start(psi))
+            {
+                var errTask = p.StandardError.ReadToEndAsync();
+                var outTask = p.StandardOutput.ReadToEndAsync();
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(); } catch { }
+                    output = ""; error = "";
+                    return -1;
+                }
+                output = outTask.Result;
+                error = errTask.Result;
+                return p.ExitCode;
+            }
+        }
+
+        // ---- getting the picture ready: enlarged to read well, grey, a little more contrast, light text on dark flipped
+        public static Bitmap Prepare(Bitmap src, bool dark, out float k)
+        {
+            float textH = TextHeight(src);
+            // Windows reads best when a line of text is about 30-40 pixels tall.
+            if (textH > 0) k = Math.Max(1f, Math.Min(3.5f, 34f / textH));
+            else k = Math.Max(src.Width, src.Height) < 1800 ? 2f : 1f;
+            float room = 9600f / Math.Max(1, Math.Max(src.Width, src.Height));
+            if (k > room) k = Math.Max(1f, room);
+            int w = Math.Max(1, (int)(src.Width * k)), h = Math.Max(1, (int)(src.Height * k));
+            var big = new Bitmap(w, h, PixelFormat.Format24bppRgb);
+            using (var g = Graphics.FromImage(big))
+            {
+                g.Clear(Color.White);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel);
+            }
+            // Grey, a little more contrast, and dark backgrounds flipped to black text on white.
+            // Done pixel by pixel (not with a ColorMatrix) so nothing wraps around at black or white.
+            var lut = new byte[256];
+            for (int v = 0; v < 256; v++)
+            {
+                int x = dark ? 255 - v : v;
+                x = (int)Math.Round((x - 128) * 1.25 + 128);
+                lut[v] = (byte)Math.Max(0, Math.Min(255, x));
+            }
+            var data = big.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadWrite, PixelFormat.Format24bppRgb);
+            try
+            {
+                var row = new byte[w * 3];
+                for (int y = 0; y < h; y++)
+                {
+                    IntPtr at = new IntPtr(data.Scan0.ToInt64() + (long)y * data.Stride);
+                    Marshal.Copy(at, row, 0, row.Length);
+                    for (int i = 0; i < row.Length; i += 3)
+                    {
+                        byte l = lut[(row[i + 2] * 299 + row[i + 1] * 587 + row[i] * 114) / 1000];
+                        row[i] = l; row[i + 1] = l; row[i + 2] = l;
+                    }
+                    Marshal.Copy(row, 0, at, row.Length);
+                }
+            }
+            finally { big.UnlockBits(data); }
+            return big;
+        }
+
+        // Dark mode: most of the picture is dark.
+        public static bool IsDark(Bitmap b)
+        {
+            var lum = new List<int>();
+            int nx = Math.Min(64, b.Width), ny = Math.Min(64, b.Height);
+            for (int j = 0; j < ny; j++)
+                for (int i = 0; i < nx; i++)
+                {
+                    Color c = b.GetPixel((int)((i + 0.5) * b.Width / nx), (int)((j + 0.5) * b.Height / ny));
+                    lum.Add((c.R * 299 + c.G * 587 + c.B * 114) / 1000);
+                }
+            if (lum.Count == 0) return false;
+            lum.Sort();
+            return lum[lum.Count / 2] < 110;
+        }
+
+        // How tall a line of text is, in pixels: the typical height of the bands of rows that have ink in them.
+        public static float TextHeight(Bitmap b)
+        {
+            int w = b.Width, h = b.Height;
+            if (w < 8 || h < 8) return 0;
+            var px = Px.Read(b);
+            int step = Math.Max(1, w / 600);
+            var runs = new List<int>();
+            int run = 0;
+            for (int y = 0; y < h; y++)
+            {
+                int lo = 255, hi = 0, o = y * w;
+                for (int x = 0; x < w; x += step)
+                {
+                    int c = px[o + x];
+                    int l = (((c >> 16) & 255) * 299 + ((c >> 8) & 255) * 587 + (c & 255) * 114) / 1000;
+                    if (l < lo) lo = l;
+                    if (l > hi) hi = l;
+                }
+                if (hi - lo > 70) run++;
+                else { if (run >= 6 && run <= 120) runs.Add(run); run = 0; }
+            }
+            if (run >= 6 && run <= 120) runs.Add(run);
+            if (runs.Count == 0) return 0;
+            runs.Sort();
+            return runs[runs.Count / 2];
         }
 
         static List<int> SliceRows(Bitmap src, int target)
@@ -1104,63 +1398,6 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             return cuts;
         }
 
-        static string RunOne(Bitmap src, out string error)
-        {
-            error = null;
-            string dir = Path.Combine(Path.GetTempPath(), "KonaSnap");
-            Directory.CreateDirectory(dir);
-            string script = Path.Combine(dir, "ocr.ps1");
-            File.WriteAllText(script, Script, new UTF8Encoding(true));
-            string imgPath = Path.Combine(dir, "ocr-" + Guid.NewGuid().ToString("N") + ".png");
-            try
-            {
-                // Small text reads better when the image is enlarged first.
-                int longest = Math.Max(src.Width, src.Height);
-                float k = longest < 1800 ? 2f : 1f;
-                using (var big = new Bitmap(Math.Max(1, (int)(src.Width * k)), Math.Max(1, (int)(src.Height * k)), PixelFormat.Format24bppRgb))
-                {
-                    using (var g = Graphics.FromImage(big))
-                    {
-                        g.Clear(Color.White);
-                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                        g.DrawImage(src, 0, 0, big.Width, big.Height);
-                    }
-                    big.Save(imgPath, ImageFormat.Png);
-                }
-
-                var psi = new System.Diagnostics.ProcessStartInfo("powershell.exe",
-                    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script + "\" \"" + imgPath + "\"");
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.RedirectStandardOutput = true;
-                psi.RedirectStandardError = true;
-                psi.StandardOutputEncoding = Encoding.UTF8;
-                psi.StandardErrorEncoding = Encoding.UTF8;
-                using (var p = System.Diagnostics.Process.Start(psi))
-                {
-                    var errTask = p.StandardError.ReadToEndAsync();
-                    string output = p.StandardOutput.ReadToEnd();
-                    if (!p.WaitForExit(60000)) { try { p.Kill(); } catch { } error = "Reading the text took too long."; return ""; }
-                    string err = errTask.Result;
-                    if (err.Contains("NO_OCR_LANGUAGE"))
-                        error = "Windows has no text-recognition language installed. Add one in Settings > Time & language > Language & region.";
-                    else if (p.ExitCode != 0 && output.Trim().Length == 0)
-                        error = "Windows couldn't read text from this image." + (err.Trim().Length > 0 ? " (" + FirstLine(err) + ")" : "");
-                    return output.Replace("\r\n", "\n").Trim();
-                }
-            }
-            catch (Exception ex)
-            {
-                error = "Text reading failed: " + ex.Message;
-                return "";
-            }
-            finally
-            {
-                try { File.Delete(imgPath); } catch { }
-            }
-        }
-
         static string FirstLine(string s)
         {
             s = s.Trim();
@@ -1168,7 +1405,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             return i > 0 ? s.Substring(0, i).Trim() : s;
         }
 
-        // Reads text on a background thread, then calls done(text, error) on the UI thread.
+        // Reads text on a background thread, then calls done(text, error) on the UI thread. Disposes bmp.
         public static void RunAsync(Control owner, Bitmap bmp, Action<string, string> done)
         {
             ThreadPool.QueueUserWorkItem(delegate
@@ -1180,6 +1417,17 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             });
         }
 
+        // Same, but hands back both versions of the text and leaves bmp alone.
+        public static void ReadAsync(Control owner, Bitmap bmp, Action<OcrText, string> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string err;
+                OcrText t = Read(bmp, out err);
+                try { owner.BeginInvoke((MethodInvoker)delegate { done(t, err); }); } catch { }
+            });
+        }
+
         public static void ShowResult(string text, string err, float S)
         {
             ShowResult(text, err, S, null);
@@ -1187,32 +1435,315 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
 
         public static void ShowResult(string text, string err, float S, string how)
         {
-            if (err != null && text.Length == 0) { MessageBox.Show(err, MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-            if (text.Length == 0) { MessageBox.Show("No text was found in that area.", MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-            try { Clipboard.SetText(text.Replace("\n", "\r\n")); } catch { }
-            var f = new TextResultForm(text, S, how);
+            var t = new OcrText();
+            t.Joined = text ?? "";
+            t.Lines = t.Joined;
+            ShowResult(t, err, S, how, null, false);
+        }
+
+        // picture: what was read (the window keeps it for "Read with PDF and Moore" and disposes it).
+        // fromApp: the text came straight from the app, not from reading the screen.
+        public static void ShowResult(OcrText t, string err, float S, string how, Bitmap picture, bool fromApp)
+        {
+            string text = t.Joined ?? "";
+            if (text.Length == 0)
+            {
+                if (picture != null && !fromApp)
+                {
+                    var ask = MessageBox.Show((err ?? "No text was found in that area.") +
+                        "\n\nTry PDF and Moore's careful reader? It straightens crooked pictures and reads faded or unusual text.",
+                        MainForm.AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                    if (ask == DialogResult.Yes) PdfLink.ReadPicture(null, picture);
+                    picture.Dispose();
+                    return;
+                }
+                if (picture != null) picture.Dispose();
+                MessageBox.Show(err ?? "No text was found in that area.", MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            try { Clipboard.SetText(text.Replace("\r\n", "\n").Replace("\n", "\r\n")); } catch { }
+            var f = new TextResultForm(t, S, how, picture, fromApp);
             f.Show();
             f.Activate();
         }
     }
 
+    // ---- turning the lines Windows found back into the text as it was written
+    static class Layout
+    {
+        static readonly System.Text.RegularExpressions.Regex ListStart = new System.Text.RegularExpressions.Regex(
+            @"^\s*([\u2022\u00B7\u25AA\u25CF\u25CB\u25E6\u25A0\u25A1\u25BA\u25B6\u2713\u2714\u2610\u2611\u2612\-\u2013\u2014\*>]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)])\s");
+
+        // Lines that belong together: close below each other and overlapping sideways.
+        static bool SameBlock(OcrLine a, OcrLine b)
+        {
+            float lh = Math.Max(1f, a.B - a.Y);
+            float gap = b.Y - a.B;
+            if (gap > 0.85f * lh || gap < -0.6f * lh) return false;
+            return b.X < a.R + 2 * lh && b.R > a.X - 2 * lh;
+        }
+
+        static List<List<OcrLine>> Blocks(List<OcrLine> lines)
+        {
+            var blocks = new List<List<OcrLine>>();
+            List<OcrLine> cur = null;
+            foreach (var l in lines)
+            {
+                if (cur == null || !SameBlock(cur[cur.Count - 1], l)) { cur = new List<OcrLine>(); blocks.Add(cur); }
+                cur.Add(l);
+            }
+            return blocks;
+        }
+
+        // One line per screen line, with a blank line between separate blocks of text.
+        public static string AsLines(List<OcrLine> lines)
+        {
+            var sb = new StringBuilder();
+            foreach (var block in Blocks(lines))
+            {
+                if (sb.Length > 0) sb.Append("\n\n");
+                for (int i = 0; i < block.Count; i++)
+                {
+                    if (i > 0) sb.Append('\n');
+                    sb.Append(block[i].Text);
+                }
+            }
+            return sb.ToString();
+        }
+
+        // Lines joined into paragraphs. A line only ends where the writer ended it: before a list item, a heading or
+        // a change of text size, an indented first line, or when the next word would have fit on the line.
+        public static string Paragraphs(List<OcrLine> lines)
+        {
+            var sb = new StringBuilder();
+            foreach (var block in Blocks(lines))
+            {
+                if (sb.Length > 0) sb.Append("\n\n");
+                float maxR = block[0].R;
+                foreach (var l in block) maxR = Math.Max(maxR, l.R);
+                bool paraIsList = ListStart.IsMatch(block[0].Text);
+                float paraX = block[0].X;
+                sb.Append(block[0].Text);
+                for (int i = 1; i < block.Count; i++)
+                {
+                    OcrLine p = block[i - 1], c = block[i];
+                    float lh = Math.Max(1f, p.B - p.Y);
+                    bool list = ListStart.IsMatch(c.Text);
+                    bool sizeChange = Math.Abs((c.B - c.Y) - lh) > 0.4f * lh;
+                    bool wouldFit = p.R + c.FirstWordW + 0.6f * lh < maxR - 0.3f * lh;
+                    bool indented = c.X > p.X + 1.2f * lh && !(paraIsList && c.X > paraX);
+                    bool outdented = c.X < paraX - 1.2f * lh;
+                    if (list || sizeChange || wouldFit || indented || outdented)
+                    {
+                        sb.Append('\n');
+                        paraIsList = list;
+                        paraX = c.X;
+                        sb.Append(c.Text);
+                        continue;
+                    }
+                    // A word split with a hyphen at the end of the line is put back together.
+                    string prev = p.Text;
+                    if (prev.Length > 2 && prev[prev.Length - 1] == '-' && char.IsLetter(prev[prev.Length - 2]) && c.Text.Length > 0 && char.IsLower(c.Text[0]))
+                    {
+                        sb.Length -= 1;
+                        sb.Append(c.Text);
+                    }
+                    else
+                    {
+                        sb.Append(' ');
+                        sb.Append(c.Text);
+                    }
+                }
+            }
+            return sb.ToString();
+        }
+    }
+
+    // ------------------------------------------------------------------ PDF and Moore (v2.2)
+    // KonaSnap hands text and pictures to John's PDF editor. PDF and Moore 9.8+ lists itself under the standard
+    // Windows "App Paths" every time it starts, so KonaSnap finds it wherever it was installed or built.
+    static class PdfLink
+    {
+        static string RegDefault(Microsoft.Win32.RegistryKey root, string key)
+        {
+            try
+            {
+                using (var k = root.OpenSubKey(key))
+                    return k == null ? null : k.GetValue("") as string;
+            }
+            catch { return null; }
+        }
+
+        static bool Ok(string p)
+        {
+            try { return !string.IsNullOrEmpty(p) && File.Exists(p); } catch { return false; }
+        }
+
+        static string ExeFromCommand(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return null;
+            cmd = cmd.Trim();
+            if (cmd.StartsWith("\""))
+            {
+                int end = cmd.IndexOf('"', 1);
+                return end > 1 ? cmd.Substring(1, end - 1) : null;
+            }
+            int sp = cmd.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+            return sp > 0 ? cmd.Substring(0, sp + 4) : null;
+        }
+
+        public static string FindExe()
+        {
+            const string appPaths = @"Software\Microsoft\Windows\CurrentVersion\App Paths\PdfAndMoore.exe";
+            string p = RegDefault(Microsoft.Win32.Registry.CurrentUser, appPaths);
+            if (Ok(p)) return p;
+            p = RegDefault(Microsoft.Win32.Registry.LocalMachine, appPaths);
+            if (Ok(p)) return p;
+            foreach (string name in new string[] { "PDF and Moore.exe", "PdfAndMoore.exe" })
+            {
+                p = ExeFromCommand(RegDefault(Microsoft.Win32.Registry.CurrentUser, @"Software\Classes\Applications\" + name + @"\shell\open\command"));
+                if (Ok(p)) return p;
+            }
+            var places = new List<string>();
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            places.Add(Path.Combine(local, @"Programs\PDF and Moore\PDF and Moore.exe"));
+            places.Add(Path.Combine(pf, @"PDF and Moore\PDF and Moore.exe"));
+            places.Add(@"C:\Moore\School\PDF and Moore\Release (app to run and share)\PDF and Moore.exe");
+            places.Add(@"C:\Moore\School\PDF and Moore\Release\PDF and Moore.exe");
+            foreach (string c in places) if (Ok(c)) return c;
+            return null;
+        }
+
+        static bool Start(IWin32Window owner, string args)
+        {
+            string exe = FindExe();
+            if (exe == null)
+            {
+                MessageBox.Show(owner, "KonaSnap couldn't find PDF and Moore on this PC.\n\nOpen PDF and Moore once (version 9.8 or newer) so KonaSnap can find it, then try again.",
+                    MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(exe, args);
+                psi.UseShellExecute = false;
+                psi.WorkingDirectory = Path.GetDirectoryName(exe);
+                System.Diagnostics.Process.Start(psi);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(owner, "Couldn't start PDF and Moore: " + ex.Message, MainForm.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+        }
+
+        // A folder of its own for each hand-over (PDF and Moore reads the file a moment later). Old ones are tidied up.
+        static string SendFolder()
+        {
+            string root = Path.Combine(Path.GetTempPath(), "KonaSnap");
+            try
+            {
+                if (Directory.Exists(root))
+                    foreach (string d in Directory.GetDirectories(root, "send-*"))
+                        if (Directory.GetCreationTime(d) < DateTime.Now.AddDays(-2)) try { Directory.Delete(d, true); } catch { }
+            }
+            catch { }
+            string dir = Path.Combine(root, "send-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        static string Stamp() { return DateTime.Now.ToString("yyyy-MM-dd HHmm"); }
+
+        // kind: "word" (a new Word document) or "text" (a new text file). It isn't saved anywhere until you press Save.
+        public static bool SendText(IWin32Window owner, string text, string kind)
+        {
+            try
+            {
+                string file = Path.Combine(SendFolder(), "KonaSnap text " + Stamp() + ".txt");
+                File.WriteAllText(file, text.Replace("\r\n", "\n").Replace("\n", "\r\n"), new UTF8Encoding(false));
+                return Start(owner, "--new-from \"" + file + "\" --as " + kind);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(owner, "Couldn't hand the text to PDF and Moore: " + ex.Message, MainForm.AppTitle);
+                return false;
+            }
+        }
+
+        // PDF and Moore's careful reader: straightens crooked pictures and reads faded or unusual text.
+        public static bool ReadPicture(IWin32Window owner, Bitmap picture)
+        {
+            try
+            {
+                string file = Path.Combine(SendFolder(), "KonaSnap picture " + Stamp() + ".png");
+                lock (MainForm.SaveLock) picture.Save(file, ImageFormat.Png);
+                return Start(owner, "--read-text \"" + file + "\"");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(owner, "Couldn't hand the picture to PDF and Moore: " + ex.Message, MainForm.AppTitle);
+                return false;
+            }
+        }
+
+        // Opens a saved capture in PDF and Moore's PDF editor (to sign, combine, fill in or email it).
+        public static bool OpenFile(IWin32Window owner, string path)
+        {
+            return Start(owner, "\"" + path + "\"");
+        }
+
+        // Lets PDF and Moore (and Win+R "KonaSnap") find KonaSnap the same way.
+        public static void RegisterSelf()
+        {
+            try
+            {
+                string exe = Application.ExecutablePath;
+                using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\App Paths\KonaSnap.exe"))
+                {
+                    if (!string.Equals(k.GetValue("") as string, exe, StringComparison.OrdinalIgnoreCase)) k.SetValue("", exe);
+                    k.SetValue("Path", Path.GetDirectoryName(exe));
+                }
+            }
+            catch { }
+        }
+    }
+
     class TextResultForm : Form
     {
-        public TextResultForm(string text, float S, string how)
+        OcrText ocr;
+        Bitmap picture;
+        bool fromApp, edited, settingText;
+        readonly TextBox tb = new TextBox();
+        readonly Label top = new Label();
+        readonly Label note = new Label();
+        readonly CheckBox join = new CheckBox();
+        readonly LinkLabel rereadLink = new LinkLabel();
+        readonly LinkLabel pdfReadLink = new LinkLabel();
+        readonly float S;
+        string how;
+
+        public TextResultForm(OcrText text, float s, string how, Bitmap picture, bool fromApp)
         {
+            ocr = text;
+            this.picture = picture;
+            this.fromApp = fromApp;
+            this.how = how;
+            S = s;
             Text = "KonaSnap - Text";
             Font = new Font("Segoe UI", 10f);
             StartPosition = FormStartPosition.CenterScreen;
-            Size = new Size((int)(720 * S), (int)(560 * S));
+            Size = new Size((int)(760 * S), (int)(600 * S));
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            var tb = new TextBox();
             tb.Multiline = true;
             tb.ScrollBars = ScrollBars.Vertical;
             tb.Dock = DockStyle.Fill;
             tb.BorderStyle = BorderStyle.None;
             tb.Font = new Font("Segoe UI", 11f);
-            tb.Text = text.Replace("\n", "\r\n");
+            tb.TextChanged += delegate { if (!settingText) edited = true; };
 
             var holder = new Panel();
             holder.Dock = DockStyle.Fill;
@@ -1220,61 +1751,81 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             holder.BackColor = Color.White;
             holder.Controls.Add(tb);
 
+            // Options under the title: how the lines are put together, and other ways to read it.
+            var opts = new FlowLayoutPanel();
+            opts.Dock = DockStyle.Top;
+            opts.AutoSize = true;
+            opts.WrapContents = true;
+            opts.Padding = new Padding((int)(8 * S), (int)(4 * S), (int)(8 * S), (int)(2 * S));
+            opts.BackColor = Theme.Foam;
+            join.Text = "Join lines into paragraphs";
+            join.AutoSize = true;
+            join.Checked = true;
+            join.Margin = new Padding(3, (int)(4 * S), (int)(16 * S), 3);
+            join.CheckedChanged += delegate { ShowText(); };
+            new ToolTip().SetToolTip(join, "On: lines that wrapped on the screen are joined, the way the text was written (best for pasting into a document).\nOff: one line for every line on the screen.");
+            rereadLink.Text = "Read the screen instead";
+            rereadLink.AutoSize = true;
+            rereadLink.Margin = new Padding(3, (int)(6 * S), (int)(16 * S), 3);
+            rereadLink.LinkColor = Theme.Ocean;
+            rereadLink.LinkClicked += delegate { ReadScreen(); };
+            new ToolTip().SetToolTip(rereadLink, "The app shared its text directly. If that picked up extra words (menus, buttons), read just what's in the picture instead.");
+            pdfReadLink.Text = "Read with PDF and Moore";
+            pdfReadLink.AutoSize = true;
+            pdfReadLink.Margin = new Padding(3, (int)(6 * S), 3, 3);
+            pdfReadLink.LinkColor = Theme.Ocean;
+            pdfReadLink.LinkClicked += delegate { if (picture != null) PdfLink.ReadPicture(this, picture); };
+            new ToolTip().SetToolTip(pdfReadLink, "For photos, scans and crooked, upside-down or faded text: PDF and Moore straightens the picture and reads it more carefully.");
+            opts.Controls.Add(join);
+            opts.Controls.Add(rereadLink);
+            opts.Controls.Add(pdfReadLink);
+
             var bottom = new FlowLayoutPanel();
             bottom.Dock = DockStyle.Bottom;
             bottom.FlowDirection = FlowDirection.RightToLeft;
             bottom.AutoSize = true;
+            bottom.WrapContents = true;
             bottom.Padding = new Padding((int)(8 * S));
-
             bottom.BackColor = Theme.Foam;
-            var close = new Button();
-            close.Text = "Close";
-            close.AutoSize = true;
-            close.FlatStyle = FlatStyle.Flat;
-            close.FlatAppearance.BorderColor = Theme.Line;
-            close.BackColor = Color.White;
-            close.ForeColor = Theme.Ink;
-            close.Padding = new Padding((int)(10 * S), (int)(3 * S), (int)(10 * S), (int)(3 * S));
+
+            var close = MakeButton("Close", Color.White, Theme.Ink, Theme.Line, false);
             close.Click += delegate { Close(); };
-            var copy = new Button();
-            copy.Text = "Copy";
-            copy.AutoSize = true;
-            copy.FlatStyle = FlatStyle.Flat;
-            copy.FlatAppearance.BorderColor = Theme.Ocean;
-            copy.BackColor = Theme.Ocean;
-            copy.ForeColor = Color.White;
-            copy.Font = new Font("Segoe UI Semibold", 10f);
-            copy.Padding = new Padding((int)(14 * S), (int)(3 * S), (int)(14 * S), (int)(3 * S));
-            var note = new Label();
-            note.AutoSize = true;
-            note.ForeColor = Color.FromArgb(85, 112, 128);
-            note.Margin = new Padding(3, (int)(8 * S), (int)(12 * S), 3);
-            note.Text = "Copied to the clipboard. Paste it into your Google Doc with Ctrl+V.";
+            var copy = MakeButton("Copy", Theme.Ocean, Color.White, Theme.Ocean, true);
             copy.Click += delegate
             {
                 try { Clipboard.SetText(tb.Text.Length > 0 ? tb.Text : " "); note.Text = "Copied again, including your edits."; } catch { }
             };
-            var gdoc = new Button();
-            gdoc.Text = "New Google Doc";
-            gdoc.AutoSize = true;
-            gdoc.FlatStyle = FlatStyle.Flat;
-            gdoc.FlatAppearance.BorderColor = Theme.Reef;
-            gdoc.BackColor = Theme.Reef;
-            gdoc.ForeColor = Color.White;
-            gdoc.Font = new Font("Segoe UI Semibold", 10f);
-            gdoc.Padding = new Padding((int)(14 * S), (int)(3 * S), (int)(14 * S), (int)(3 * S));
+            var gdoc = MakeButton("New Google Doc", Theme.Reef, Color.White, Theme.Reef, true);
             gdoc.Click += delegate
             {
                 try { Clipboard.SetText(tb.Text.Length > 0 ? tb.Text : " "); } catch { }
                 try { System.Diagnostics.Process.Start("https://docs.new"); note.Text = "A new Google Doc is opening. Click in it and press Ctrl+V."; }
                 catch (Exception ex) { note.Text = "Couldn't open the browser: " + ex.Message; }
             };
+            var pam = MakeButton("PDF and Moore \u25BE", Theme.Sunset, Color.White, Theme.Sunset, true);
+            var menu = new ContextMenuStrip();
+            menu.Font = new Font("Segoe UI", 10f);
+            menu.Items.Add("New Word document with this text", null, delegate
+            {
+                if (PdfLink.SendText(this, tb.Text, "word")) note.Text = "Opening a new Word document in PDF and Moore...";
+            });
+            menu.Items.Add("New text file with this text", null, delegate
+            {
+                if (PdfLink.SendText(this, tb.Text, "text")) note.Text = "Opening a new text file in PDF and Moore...";
+            });
+            pam.Click += delegate { menu.Show(pam, new Point(0, pam.Height)); };
+            new ToolTip().SetToolTip(pam, "Open this text in PDF and Moore as a new Word document or text file");
+
+            note.AutoSize = true;
+            note.ForeColor = Color.FromArgb(85, 112, 128);
+            note.Margin = new Padding(3, (int)(8 * S), (int)(12 * S), 3);
+            note.Text = "Copied to the clipboard. Paste it with Ctrl+V.";
             bottom.Controls.Add(close);
             bottom.Controls.Add(copy);
             bottom.Controls.Add(gdoc);
+            bottom.Controls.Add(pam);
             bottom.Controls.Add(note);
 
-            var top = new Label();
             top.Dock = DockStyle.Top;
             top.AutoSize = false;
             top.Height = (int)(34 * S);
@@ -1283,13 +1834,72 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             top.BackColor = Theme.Ocean;
             top.ForeColor = Color.White;
             top.Font = new Font("Segoe UI Semibold", 9.5f);
-            int words = text.Split(new char[] { ' ', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries).Length;
-            top.Text = words + " words" + (how != null ? "  •  " + how : "");
 
             Controls.Add(holder);
+            Controls.Add(opts);
             Controls.Add(top);
             Controls.Add(bottom);
             AcceptButton = copy;
+            FormClosed += delegate { if (picture != null) { picture.Dispose(); picture = null; } };
+            ShowText();
+        }
+
+        Button MakeButton(string text, Color back, Color fore, Color border, bool bold)
+        {
+            var b = new Button();
+            b.Text = text;
+            b.AutoSize = true;
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderColor = border;
+            b.BackColor = back;
+            b.ForeColor = fore;
+            if (bold) b.Font = new Font("Segoe UI Semibold", 10f);
+            b.Padding = new Padding((int)(12 * S), (int)(3 * S), (int)(12 * S), (int)(3 * S));
+            return b;
+        }
+
+        void ShowText()
+        {
+            if (settingText) return;
+            bool canJoin = !fromApp && ocr.Lines != ocr.Joined && ocr.Lines.Length > 0;
+            join.Visible = canJoin;
+            rereadLink.Visible = fromApp && picture != null;
+            pdfReadLink.Visible = picture != null;
+            string t = canJoin && !join.Checked ? ocr.Lines : ocr.Joined;
+            if (edited && tb.Text.Replace("\r\n", "\n") != t)
+            {
+                var ask = MessageBox.Show(this, "Switching this loses the changes you typed. Switch anyway?", MainForm.AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (ask != DialogResult.Yes) { settingText = true; join.Checked = !join.Checked; settingText = false; return; }
+            }
+            settingText = true;
+            tb.Text = t.Replace("\r\n", "\n").Replace("\n", "\r\n");
+            settingText = false;
+            edited = false;
+            int words = t.Split(new char[] { ' ', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries).Length;
+            top.Text = words + " words" + (how != null ? "  \u2022  " + how : "");
+            try { Clipboard.SetText(t.Length > 0 ? t.Replace("\r\n", "\n").Replace("\n", "\r\n") : " "); } catch { }
+        }
+
+        // The app's own text had extra words in it: read just what's in the picture.
+        void ReadScreen()
+        {
+            if (picture == null) return;
+            rereadLink.Enabled = false;
+            note.Text = "Reading the picture...";
+            UseWaitCursor = true;
+            Ocr.ReadAsync(this, picture, delegate(OcrText t, string err)
+            {
+                UseWaitCursor = false;
+                rereadLink.Enabled = true;
+                if (t.Joined.Length == 0) { note.Text = err ?? "No text was found in the picture."; return; }
+                ocr = t;
+                fromApp = false;
+                edited = false;
+                how = "Read from the picture";
+                join.Checked = true;
+                ShowText();
+                note.Text = "Read from the picture and copied.";
+            });
         }
     }
 
@@ -1684,15 +2294,25 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             ScrollIndicator ind = null;
             var th = new Thread(delegate()
             {
-                string text = null, err = null, how = null;
+                OcrText result = null;
+                string err = null, how = null;
+                bool fromApp = false;
+                Bitmap keep = picture; // shown with the text, for "Read with PDF and Moore" / "Read the screen instead"
                 try
                 {
                     if (element != null)
                     {
-                        text = TextGrab.Direct(element);
-                        if (!string.IsNullOrEmpty(text)) how = "Read straight from the page (exact words, including the part scrolled out of view)";
+                        string direct = TextGrab.Direct(element);
+                        if (!string.IsNullOrEmpty(direct))
+                        {
+                            result = new OcrText();
+                            result.Joined = direct;
+                            result.Lines = direct;
+                            fromApp = true;
+                            how = "Read straight from the page (exact words, including the part scrolled out of view)";
+                        }
                     }
-                    if (string.IsNullOrEmpty(text) && element != null && screenRect.Height >= 120 && screenRect.Width >= 120)
+                    if (result == null && element != null && screenRect.Height >= 120 && screenRect.Width >= 120)
                     {
                         try { Invoke((MethodInvoker)delegate { ind = new ScrollIndicator(screenRect, s); ind.SetText("Reading the box..."); ind.Show(); }); } catch { }
                         Thread.Sleep(200);
@@ -1704,30 +2324,39 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
                         if (ind != null) try { ind.BeginInvoke((MethodInvoker)delegate { ind.SetText("Reading the words..."); }); } catch { }
                         if (tall != null)
                         {
-                            text = Ocr.Run(tall, out err);
-                            tall.Dispose();
-                            how = "Scrolled the box and read the words from the screen. Check for small reading mistakes";
+                            OcrText t = Ocr.Read(tall, out err);
+                            if (t.Joined.Length > 0)
+                            {
+                                result = t;
+                                how = "Scrolled the box and read the words from the screen. Check for small reading mistakes";
+                                keep.Dispose();
+                                keep = tall; // the whole scrolled box, so PDF and Moore can read all of it too
+                            }
+                            else tall.Dispose();
                         }
                     }
-                    if (string.IsNullOrEmpty(text))
+                    if (result == null)
                     {
-                        text = Ocr.Run(picture, out err);
+                        result = Ocr.Read(picture, out err);
                         how = "Read from the picture of that area";
                     }
                 }
                 catch (Exception ex) { err = "Text grab failed: " + ex.Message; }
-                picture.Dispose();
-                string final = text ?? "";
+                if (result == null) result = new OcrText();
+                OcrText final = result;
+                string why = how, problem = err;
+                bool app = fromApp;
+                Bitmap pic = keep;
                 try
                 {
                     BeginInvoke((MethodInvoker)delegate
                     {
                         if (ind != null) try { ind.Close(); } catch { }
                         finish(null);
-                        Ocr.ShowResult(final, err, s, how);
+                        Ocr.ShowResult(final, problem, s, why, pic, app);
                     });
                 }
-                catch { }
+                catch { pic.Dispose(); }
             });
             th.IsBackground = true;
             th.SetApartmentState(ApartmentState.MTA);
@@ -3559,6 +4188,7 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             AddAction("100%", "actual", "Actual size (Ctrl+1)", delegate { SetZoom(1f); });
             AddAction("Fit", "fit", "Zoom to fit (Ctrl+0)", delegate { ZoomFit(); });
             AddSep();
+            AddAction("PDF and Moore", "pdfmoore", "Open this picture in PDF and Moore to sign it, fill it in, combine it with other files or email it", delegate { OpenInPdfAndMoore(); });
             AddAction("Save as", "saveas", "Save a copy as PNG or JPG", delegate { SaveAs(); });
             AddAction("Save", "save", "Save (Ctrl+S)", delegate { Save(); });
             AddAction("Copy text", "copytext", "Read the words in this image and copy them (Ctrl+Shift+C)", delegate { CopyText(); });
@@ -4030,12 +4660,13 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
             reading = true;
             status.Text = "Reading text...";
             UseWaitCursor = true;
-            Ocr.RunAsync(this, Render(), delegate(string text, string err)
+            Bitmap pic = Render();
+            Ocr.ReadAsync(this, pic, delegate(OcrText t, string err)
             {
                 reading = false;
                 UseWaitCursor = false;
-                status.Text = text.Length > 0 ? "Text copied to the clipboard." : (err ?? "No text found.");
-                Ocr.ShowResult(text, err, S);
+                status.Text = t.Joined.Length > 0 ? "Text copied to the clipboard." : (err ?? "No text found.");
+                Ocr.ShowResult(t, err, S, "Read from the picture", pic, false);
             });
         }
 
@@ -4049,6 +4680,13 @@ foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
                 status.Text = "Saved to " + path;
             }
             catch (Exception ex) { status.Text = "Couldn't save: " + ex.Message; }
+        }
+
+        // v2.2: the capture (with your markup) opens as a PDF in PDF and Moore.
+        void OpenInPdfAndMoore()
+        {
+            Save();
+            if (PdfLink.OpenFile(this, path)) status.Text = "Opening in PDF and Moore...";
         }
 
         public void SaveIfDirty()

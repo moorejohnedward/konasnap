@@ -1,5 +1,22 @@
 # Changelog - KonaSnap
 
+## v2.2.0 - Nov 16, 2026 (Much better text grab, and linked to PDF and Moore)
+- **Text comes out the way it was written.** Before, every line on the screen became its own line, so pasting into a Google Doc gave broken sentences with a hard break every few words. Now KonaSnap gets the position of every word from Windows and rebuilds the text:
+  - Lines that only wrapped because the box was narrow are joined back into one paragraph.
+  - Headings, list items (•, -, 1., a)), short lines like addresses, indented paragraphs and changes in text size stay on their own lines.
+  - A word split with a hyphen at the end of a line is put back together.
+  - Separate blocks of text get a blank line between them, and wide gaps (like table columns) become a tab.
+  - Want it exactly line for line? Untick **Join lines into paragraphs** in the text window.
+- **Dark mode reads properly:** light text on a dark background is flipped to black on white before reading.
+- **Small text reads better:** KonaSnap measures how tall the text is and enlarges the picture just enough (about 34 pixels per line, the size Windows reads best), instead of always doubling. It also turns the picture grey and adds a little contrast.
+- **Faster on long captures:** a scrolling capture is read in one go instead of starting Windows' reader over for every slice.
+- **Read the screen instead:** when the words came straight from the app but picked up extra text (menus, buttons), one click reads just what's in the picture.
+- **Linked to PDF and Moore** (needs PDF and Moore 9.8 or newer):
+  - Text window › **PDF and Moore ▾** › **New Word document with this text** or **New text file with this text**. It opens as a new, unsaved file; Save asks where to put it.
+  - Text window › **Read with PDF and Moore**: for photos, scans and crooked, upside-down or faded text. PDF and Moore straightens the picture and reads it more carefully. When KonaSnap finds no text at all, it offers this too.
+  - Markup window › **PDF and Moore** button: opens the capture (with your markup) as a PDF, ready to sign, fill in, combine or email.
+  - KonaSnap finds PDF and Moore wherever it's installed or built (PDF and Moore lists itself with Windows each time it starts). KonaSnap lists itself the same way, so Win+R › "KonaSnap" works too.
+
 ## v2.1.3 - Nov 13, 2026 (Check for updates actually finds updates)
 - **Fixed: "Check for updates" always said KonaSnap was up to date**, even when a newer version was on GitHub. It couldn't read the download link out of GitHub's answer, so it never saw any new version. It now finds the download, its size and its safety fingerprint correctly.
 - This one has to be installed by hand once (run build.bat, or download KonaSnap.exe from the GitHub release). After that, updates come through Check for updates.
